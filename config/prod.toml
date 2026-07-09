@@ -1,0 +1,37 @@
+# 工业生产配置：TLS 加密、文件日志、限流开启、持久化开启
+[broker]
+max_connections = 200000
+max_packet_size = 1048576
+
+[tcp]
+enabled = true
+bind = "0.0.0.0:1883"
+
+[tls]
+enabled = true
+bind = "0.0.0.0:8883"
+cert = "certs/server.crt"
+key = "certs/server.key"
+ca = "certs/ca.crt"
+mutual = true
+
+[websocket]
+enabled = true
+bind = "0.0.0.0:8083"
+path = "/mqtt"
+
+[storage]
+enabled = true
+path = "./data/lumenmq"
+max_offline_messages = 5000
+offline_message_ttl = 604800    # 7 天
+
+[log]
+level = "info"
+format = "json"
+dir = "./logs"
+rotation = "daily"
+
+[admin]
+enabled = true
+bind = "0.0.0.0:9090"

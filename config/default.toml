@@ -1,0 +1,125 @@
+# LumenMQ 默认配置 —— 工业级轻量化 MQTT Broker
+
+[broker]
+# 节点标识
+node_id = "lumenmq@127.0.0.1"
+# 单节点最大并发连接数
+max_connections = 100000
+# 单个报文最大长度（字节），防止内存溢出
+max_packet_size = 1048576        # 1 MiB
+# 默认心跳保活时长（秒），CONNECT 可覆盖
+default_keep_alive = 120
+# 单客户端最大订阅数
+max_subscriptions_per_client = 256
+# 单客户端最大 inflight QoS1/2 报文数
+max_inflight = 1024
+
+# TCP MQTT 监听
+[tcp]
+enabled = true
+bind = "0.0.0.0:1883"
+
+# TLS MQTT 监听（阶段三启用）
+[tls]
+enabled = false
+bind = "0.0.0.0:8883"
+cert = "certs/server.crt"
+key = "certs/server.key"
+ca = "certs/ca.crt"
+mutual = false
+
+# WebSocket MQTT（阶段三启用）
+[websocket]
+enabled = false
+bind = "0.0.0.0:8083"
+path = "/mqtt"
+
+# MQTT-SN UDP（阶段三启用）
+[mqtt_sn]
+enabled = false
+bind = "0.0.0.0:1884"
+
+[auth]
+# 鉴权模式：anonymous | username_password | token
+mode = "username_password"
+allow_anonymous = false
+# 内置账号列表（生产环境应接入外部认证）
+[[auth.users]]
+username = "admin"
+password = "public"
+# 可选：限制可发布/订阅主题前缀
+# publish_acl = ["sensor/#"]
+# subscribe_acl = ["sensor/#"]
+
+[storage]
+# 嵌入式 KV 存储（阶段三启用）
+enabled = false
+path = "./data/lumenmq"
+# 离线消息队列最大长度
+max_offline_messages = 1000
+# 离线消息过期时间（秒）
+offline_message_ttl = 86400
+
+[log]
+level = "info"
+# 输出格式：compact | json | full
+format = "compact"
+# 日志目录（为空则只输出到 stdout）
+dir = ""
+# 日志文件滚动：hourly | daily | never
+rotation = "daily"
+
+[monitor]
+metrics_enabled = true
+health_check_interval = 30        # 秒
+
+[admin]
+# HTTP 运维接口（阶段五启用）
+enabled = false
+bind = "0.0.0.0:9090"
+
+[security]
+# 安全中间件（阶段四启用）
+enabled = false
+# IP 黑名单（CIDR 或单 IP，如 "10.0.0.0/8"、"192.168.1.5"）
+ip_blacklist = []
+# IP 白名单（非空时仅允许白名单内 IP 连接）
+ip_whitelist = []
+# 单 IP 最大并发连接数；0 表示不限制
+max_connections_per_ip = 0
+# 单客户端每秒最大入站 PUBLISH 数；0 表示不限制
+publish_rate_per_second = 0
+# 单客户端最大 PUBLISH 载荷字节数；0 表示使用 broker.max_packet_size
+max_payload_bytes = 0
+
+[plugin]
+# 消息插件中间件（阶段四启用）：主题 ACL + 载荷黑白名单 + HTTP 转发 hook
+enabled = false
+
+[plugin.topic_acl]
+# 禁止发布的主题过滤器（如 ["cmd/#", "internal/+"]）
+publish_blacklist = []
+# 允许发布的主题过滤器；非空时仅允许匹配的消息发布
+publish_whitelist = []
+# 禁止订阅的主题过滤器
+subscribe_blacklist = []
+# 允许订阅的主题过滤器；非空时仅允许匹配的订阅
+subscribe_whitelist = []
+
+[plugin.payload_filter]
+enabled = false
+# 载荷包含任一关键字则拒绝（按字节子串匹配，兼容非 UTF-8）
+blacklist_keywords = []
+# 载荷必须包含其中任一关键字才放行；非空时启用白名单模式
+whitelist_keywords = []
+
+[plugin.forward]
+# HTTP 转发 hook：将匹配主题的入站 PUBLISH 异步 POST 到外部 HTTP 端点
+enabled = false
+url = ""
+# 仅转发匹配此过滤器的主题（如 "sensor/#"）；为空则转发全部
+topic_filter = ""
+# HTTP 请求超时（秒）
+timeout_secs = 5
+# 转发队列最大长度（溢出时丢弃最旧消息，防 OOM）
+max_queue = 1024

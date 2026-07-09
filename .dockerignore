@@ -1,0 +1,21 @@
+# 编译产物
+target/
+# 版本控制
+.git/
+.gitignore
+# IDE
+.vscode/
+.idea/
+*.swp
+# 运行时数据（不应打入镜像）
+data/
+logs/
+# 文档（不需要打入镜像）
+*.md
+docs/
+# 测试产物
+test_out.txt
+# Docker 自身（避免循环 COPY）
+Dockerfile
+docker-compose*.yml
+.dockerignore

@@ -1,0 +1,25 @@
+# Rust
+/target
+Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# 运行时数据
+/data/
+/logs/
+*.log
+*.pid
+
+# 配置覆盖
+config/local.toml
+
+# 证书私钥（仅示例保留）
+certs/*.key
+!certs/example.key
+
+# 操作系统
+.DS_Store
+Thumbs.db

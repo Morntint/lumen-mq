@@ -1,0 +1,73 @@
+# LumenMQ — Docker Compose 部署编排
+#
+# 启动：docker compose up -d
+# 查看日志：docker compose logs -f lumenmq
+# 健康检查：curl http://localhost:9090/health
+# 指标：curl http://localhost:9090/metrics
+#
+# 数据卷：
+#   lumenmq-data   — sled 持久化存储（会话/离线消息/retained）
+#   lumenmq-logs   — 日志文件（JSON 格式，按天滚动）
+#   lumenmq-certs  — TLS 证书（需手动放入 server.crt / server.key / ca.crt）
+#   lumenmq-config — 自定义配置覆盖（放入 docker.toml 覆盖默认 prod 配置）
+
+services:
+  lumenmq:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: lumenmq:latest
+    container_name: lumenmq
+    restart: unless-stopped
+
+    ports:
+      - "1883:1883"     # MQTT TCP
+      - "8883:8883"     # MQTT TLS
+      - "8083:8083"     # WebSocket MQTT
+      - "1884:1884/udp" # MQTT-SN UDP
+      - "9090:9090"     # Admin HTTP / Prometheus metrics
+
+    volumes:
+      - lumenmq-data:/app/data
+      - lumenmq-logs:/app/logs
+      - lumenmq-certs:/app/certs:ro
+      - lumenmq-config:/app/config
+
+    environment:
+      LUMENMQ_CONFIG_DIR: /app/config
+      LUMENMQ_PROFILE: prod
+      RUST_LOG: info
+      RUST_BACKTRACE: "1"
+
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9090/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+    # 资源限制（工业部署按实际硬件调整）
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "2.0"
+        reservations:
+          memory: 128M
+          cpus: "0.5"
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  lumenmq-data:
+    driver: local
+  lumenmq-logs:
+    driver: local
+  lumenmq-certs:
+    driver: local
+  lumenmq-config:
+    driver: local

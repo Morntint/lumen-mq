@@ -1,0 +1,11 @@
+# 开发环境配置：开启调试日志、降低并发上限
+[broker]
+max_connections = 1000
+
+[log]
+level = "debug"
+format = "compact"
+dir = ""
+
+[monitor]
+metrics_enabled = true
