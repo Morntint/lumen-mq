@@ -244,6 +244,13 @@ impl SessionManager {
         self.sessions.remove(client_id).map(|(_, v)| v)
     }
 
+    /// 仅当 epoch 匹配时移除会话（避免竞态误删重连后的新会话）
+    pub fn remove_if_epoch(&self, client_id: &str, epoch: u64) -> Option<SessionEntry> {
+        self.sessions
+            .remove_if(client_id, |_, e| e.epoch == epoch)
+            .map(|(_, v)| v)
+    }
+
     /// 标记离线但保留（用于 clean_session=false 的会话恢复）
     /// 记录 offline_at 时间戳，供 session_expiry 过期判断使用
     pub fn mark_offline(&self, client_id: &str, epoch: u64) {
@@ -284,11 +291,29 @@ impl SessionManager {
                 expired_ids.push(entry.client_id.clone());
             }
         }
-        // 移除已过期的会话
+        // 条件移除：仅在 entry 仍为离线且已过期时移除，避免误删重连的新会话
+        let mut removed = Vec::new();
         for id in &expired_ids {
-            self.sessions.remove(id);
+            let is_still_expired = self
+                .sessions
+                .get(id)
+                .map(|e| {
+                    if e.connected {
+                        return false;
+                    }
+                    match (e.session_expiry, e.offline_at) {
+                        (Some(0), _) => true,
+                        (Some(secs), Some(at)) => now.duration_since(at).as_secs() >= secs as u64,
+                        _ => false,
+                    }
+                })
+                .unwrap_or(false);
+            if is_still_expired {
+                self.sessions.remove(id);
+                removed.push(id.clone());
+            }
         }
-        expired_ids
+        removed
     }
 
     /// 检查某个 client_id 的会话是否已因 session_expiry 过期

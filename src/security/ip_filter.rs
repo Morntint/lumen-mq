@@ -60,12 +60,13 @@ impl IpRule {
 
     /// 判断目标 IP 是否命中本规则
     fn matches(&self, ip: IpAddr) -> bool {
-        let masked = apply_mask(ip, self.prefix);
-        match (self.network, masked) {
-            (IpAddr::V4(a), IpAddr::V4(b)) => a == b,
-            (IpAddr::V6(a), IpAddr::V6(b)) => a == b,
-            _ => false, // IPv4 与 IPv6 不可互通
+        // 版本不匹配直接放行，避免 apply_mask 跨版本算术下溢 panic
+        match (&self.network, ip) {
+            (IpAddr::V4(_), IpAddr::V4(_)) | (IpAddr::V6(_), IpAddr::V6(_)) => {}
+            _ => return false,
         }
+        let masked = apply_mask(ip, self.prefix);
+        self.network == masked
     }
 }
 
@@ -73,6 +74,7 @@ impl IpRule {
 fn apply_mask(ip: IpAddr, prefix: u8) -> IpAddr {
     match ip {
         IpAddr::V4(v4) => {
+            let prefix = prefix.min(32);
             let bits = u32::from(v4);
             let mask = if prefix == 0 {
                 0
@@ -82,6 +84,7 @@ fn apply_mask(ip: IpAddr, prefix: u8) -> IpAddr {
             IpAddr::V4(Ipv4Addr::from(bits & mask))
         }
         IpAddr::V6(v6) => {
+            let prefix = prefix.min(128);
             let bits = u128::from(v6);
             let mask = if prefix == 0 {
                 0

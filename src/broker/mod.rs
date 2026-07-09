@@ -428,6 +428,8 @@ impl BrokerState {
         });
         if sink.send(connack).await.is_err() {
             self.cleanup(&client_id, epoch, clean);
+            METRICS.dec_connections();
+            METRICS.inc_disconnect();
             return Ok(());
         }
 
@@ -460,6 +462,8 @@ impl BrokerState {
                 &mut outbound_inflight,
             )).await.is_err() {
                 self.on_abnormal_disconnect(&client_id, epoch, clean);
+                METRICS.dec_connections();
+                METRICS.inc_disconnect();
                 return Ok(());
             }
         }
@@ -493,7 +497,8 @@ impl BrokerState {
                     for (_pid, pkt) in to_resend {
                         if sink.send(pkt).await.is_err() {
                             self.on_abnormal_disconnect(&client_id, epoch, clean);
-                            // 跳出 select 后需要外部 break
+                            METRICS.dec_connections();
+                            METRICS.inc_disconnect();
                             return Ok(());
                         }
                     }
@@ -575,7 +580,11 @@ impl BrokerState {
             // QoS0：无需 inflight
             return Router::build_publish(req.clone(), None);
         }
-        let pid = allocate_pid(next_pid);
+        let pid = allocate_pid(next_pid, inflight);
+        if pid == 0 {
+            // inflight 表已满，降级为 QoS0（丢弃 packet_id，不跟踪 inflight）
+            return Router::build_publish(req.clone(), None);
+        }
         let entry = OutboundInflight::new(
             req.topic.clone(),
             req.payload.clone(),
@@ -850,7 +859,8 @@ impl BrokerState {
         }
         if clean {
             self.subscriptions.unsubscribe_all(client_id);
-            self.sessions.remove(client_id);
+            // 使用 remove_if_epoch 原子移除，避免 owns→remove 之间的竞态误删重连会话
+            self.sessions.remove_if_epoch(client_id, epoch);
             // clean 会话：删除磁盘上的会话快照与残留离线消息
             self.delete_session_snapshot(client_id);
         } else {
@@ -860,7 +870,7 @@ impl BrokerState {
             if self.sessions.is_session_expired(client_id) {
                 debug!(client = %client_id, "session expired (expiry=0), cleaning up");
                 self.subscriptions.unsubscribe_all(client_id);
-                self.sessions.remove(client_id);
+                self.sessions.remove_if_epoch(client_id, epoch);
                 self.delete_session_snapshot(client_id);
                 return;
             }
@@ -893,12 +903,22 @@ impl BrokerState {
     }
 }
 
-/// 分配一个未使用的 packet_id（绕过 0）
-fn allocate_pid(next: &mut u16) -> u16 {
-    let p = *next;
-    *next = next.wrapping_add(1);
-    if *next == 0 {
-        *next = 1;
+/// 分配一个未使用的 packet_id（绕过 0，且跳过仍在 inflight 中的 id）
+/// MQTT 规范要求：MUST NOT reuse a Packet Identifier that is still in use
+fn allocate_pid(next: &mut u16, inflight: &OutboundInflightTable) -> u16 {
+    // 最多尝试 65535 次，避免极端情况下的死循环
+    for _ in 0..65535 {
+        let p = *next;
+        *next = next.wrapping_add(1);
+        if *next == 0 {
+            *next = 1;
+        }
+        // 跳过 0（规范保留）和仍在 inflight 中的 id
+        if p != 0 && inflight.get(p).is_none() {
+            return p;
+        }
     }
-    p
+    // 理论上仅当 inflight 表满（65534 条）时才会走到这里
+    // 返回 0 表示分配失败，调用方应降级处理（丢弃消息）
+    0
 }

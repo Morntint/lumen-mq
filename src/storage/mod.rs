@@ -109,20 +109,24 @@ impl Storage {
     // ---------- 离线消息 ----------
 
     /// 追加一条离线消息到客户端的队列（按 client_id 作 key，value 是 JSON 数组中的一个元素）
-    /// 简化实现：把所有消息作为一个数组序列化整体写入；阶段五可优化为 sled 批量增量
+    /// 使用 sled 事务保证并发追加的原子性，避免 RMW 竞态导致消息丢失
     pub fn push_offline(&self, client_id: &str, msg: &OutboundPublish) -> Result<(), BrokerError> {
         crate::monitor::METRICS.inc_storage_write();
-        let mut current: Vec<OutboundPublish> = match self.offline.get(client_id) {
-            Ok(Some(v)) => serde_json::from_slice(&v).unwrap_or_default(),
-            Ok(None) => Vec::new(),
-            Err(e) => return Err(BrokerError::Storage(format!("read offline: {e}"))),
-        };
-        current.push(msg.clone());
-        let bytes = serde_json::to_vec(&current)
-            .map_err(|e| BrokerError::Storage(format!("serialize offline: {e}")))?;
+        let msg = msg.clone();
         self.offline
-            .insert(client_id, bytes)
-            .map_err(|e| BrokerError::Storage(format!("write offline: {e}")))?;
+            .transaction(|tree| {
+                let current: Vec<OutboundPublish> = tree
+                    .get(client_id)?
+                    .and_then(|v| serde_json::from_slice(&v).ok())
+                    .unwrap_or_default();
+                let mut updated = current;
+                updated.push(msg.clone());
+                let bytes = serde_json::to_vec(&updated)
+                    .map_err(|e| sled::transaction::ConflictableTransactionError::Abort(e.to_string()))?;
+                tree.insert(client_id, bytes)?;
+                Ok(())
+            })
+            .map_err(|e| BrokerError::Storage(format!("push_offline transaction: {e}")))?;
         Ok(())
     }
 
@@ -134,7 +138,13 @@ impl Storage {
             .remove(client_id)
             .map_err(|e| BrokerError::Storage(format!("drain offline: {e}")))?;
         match v {
-            Some(bytes) => Ok(serde_json::from_slice(&bytes).unwrap_or_default()),
+            Some(bytes) => match serde_json::from_slice(&bytes) {
+                Ok(msgs) => Ok(msgs),
+                Err(e) => {
+                    warn!(error = %e, client = %client_id, "corrupted offline data, returning empty");
+                    Ok(Vec::new())
+                }
+            },
             None => Ok(Vec::new()),
         }
     }

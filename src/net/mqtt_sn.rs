@@ -279,8 +279,8 @@ fn encode_packet(p: &SnPacket) -> Vec<u8> {
     out.push(0u8);
     match p {
         SnPacket::Connack { return_code } => {
+            // MQTT-SN 规范：CONNACK = Length | MsgType | ReturnCode（无 flags 字节）
             out.push(MSG_CONNACK);
-            out.push(0u8); // flags
             out.push(*return_code);
         }
         SnPacket::Regack { flags, topic_id, msg_id, return_code } => {

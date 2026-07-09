@@ -1,4 +1,4 @@
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{BufMut, BytesMut};
 use tokio_util::codec::{Decoder, Encoder};
 
 use crate::utils::CodecError;
@@ -39,7 +39,8 @@ impl Decoder for MqttCodec {
         };
         let total = header_len + remaining_len;
         if total > self.max_packet_size {
-            src.advance(total); // 丢弃越界包
+            // 不 advance：返回 Err 让 FramedRead 关闭连接，
+            // 避免 src.advance(total) 在 total > src.len() 时越界 panic
             return Err(CodecError::MalformedBody(format!(
                 "packet length {total} exceeds max {}",
                 self.max_packet_size
@@ -268,13 +269,13 @@ fn decode_packet(first: u8, payload: &[u8]) -> Result<Packet, CodecError> {
         PacketType::Connect => decode_connect(&mut r)?,
         PacketType::Connack => decode_connack(&mut r)?,
         PacketType::Publish => decode_publish(&mut r, flags)?,
-        PacketType::Puback => Packet::Puback(r.read_u16()?),
-        PacketType::Pubrec => Packet::Pubrec(r.read_u16()?),
+        PacketType::Puback => Packet::Puback(validate_packet_id(r.read_u16()?)?),
+        PacketType::Pubrec => Packet::Pubrec(validate_packet_id(r.read_u16()?)?),
         PacketType::Pubrel => {
             validate_flags(ptype, flags)?;
-            Packet::Pubrel(r.read_u16()?)
+            Packet::Pubrel(validate_packet_id(r.read_u16()?)?)
         }
-        PacketType::Pubcomp => Packet::Pubcomp(r.read_u16()?),
+        PacketType::Pubcomp => Packet::Pubcomp(validate_packet_id(r.read_u16()?)?),
         PacketType::Subscribe => {
             validate_flags(ptype, flags)?;
             decode_subscribe(&mut r)?
@@ -284,7 +285,7 @@ fn decode_packet(first: u8, payload: &[u8]) -> Result<Packet, CodecError> {
             validate_flags(ptype, flags)?;
             decode_unsubscribe(&mut r)?
         }
-        PacketType::Unsuback => Packet::Unsuback(r.read_u16()?),
+        PacketType::Unsuback => Packet::Unsuback(validate_packet_id(r.read_u16()?)?),
         PacketType::Pingreq => {
             validate_flags(ptype, flags)?;
             Packet::Pingreq
@@ -320,6 +321,16 @@ fn validate_flags(ptype: PacketType, flags: u8) -> Result<(), CodecError> {
         return Err(CodecError::InvalidFlags(ptype as u8, flags));
     }
     Ok(())
+}
+
+/// 校验 packet_id 非零（MQTT 3.1.1 [MQTT-2.3.1-1]：QoS>0 报文与 ACK 报文的 id 不得为 0）
+fn validate_packet_id(pid: u16) -> Result<u16, CodecError> {
+    if pid == 0 {
+        return Err(CodecError::MalformedBody(
+            "packet id must not be zero".into(),
+        ));
+    }
+    Ok(pid)
 }
 
 fn decode_connect(r: &mut Reader) -> Result<Packet, CodecError> {
@@ -433,7 +444,7 @@ fn decode_publish(r: &mut Reader, flags: u8) -> Result<Packet, CodecError> {
     let retain = (flags & 0b0001) != 0;
     let topic = r.read_string()?;
     let packet_id = if qos != QoS::AtMostOnce {
-        Some(r.read_u16()?)
+        Some(validate_packet_id(r.read_u16()?)?)
     } else {
         None
     };
@@ -449,7 +460,7 @@ fn decode_publish(r: &mut Reader, flags: u8) -> Result<Packet, CodecError> {
 }
 
 fn decode_subscribe(r: &mut Reader) -> Result<Packet, CodecError> {
-    let packet_id = r.read_u16()?;
+    let packet_id = validate_packet_id(r.read_u16()?)?;
     let mut topics = Vec::new();
     while r.remaining() > 0 {
         let topic_filter = r.read_string()?;
@@ -464,7 +475,7 @@ fn decode_subscribe(r: &mut Reader) -> Result<Packet, CodecError> {
 }
 
 fn decode_suback(r: &mut Reader) -> Result<Packet, CodecError> {
-    let packet_id = r.read_u16()?;
+    let packet_id = validate_packet_id(r.read_u16()?)?;
     let mut return_codes = Vec::new();
     while r.remaining() > 0 {
         return_codes.push(r.read_u8()?);
@@ -476,7 +487,7 @@ fn decode_suback(r: &mut Reader) -> Result<Packet, CodecError> {
 }
 
 fn decode_unsubscribe(r: &mut Reader) -> Result<Packet, CodecError> {
-    let packet_id = r.read_u16()?;
+    let packet_id = validate_packet_id(r.read_u16()?)?;
     let mut topic_filters = Vec::new();
     while r.remaining() > 0 {
         topic_filters.push(r.read_string()?);
@@ -495,7 +506,7 @@ fn decode_unsubscribe(r: &mut Reader) -> Result<Packet, CodecError> {
 fn encode_packet_body(p: &Packet, out: &mut BytesMut) -> Result<(PacketType, u8), CodecError> {
     match p {
         Packet::Connect(c) => {
-            encode_connect(c, out);
+            encode_connect(c, out)?;
             Ok((PacketType::Connect, 0))
         }
         Packet::Connack(c) => {
@@ -508,7 +519,7 @@ fn encode_packet_body(p: &Packet, out: &mut BytesMut) -> Result<(PacketType, u8)
             Ok((PacketType::Connack, 0))
         }
         Packet::Publish(pub_) => {
-            let flags = encode_publish(pub_, out);
+            let flags = encode_publish(pub_, out)?;
             Ok((PacketType::Publish, flags))
         }
         Packet::Puback(id) => {
@@ -528,7 +539,7 @@ fn encode_packet_body(p: &Packet, out: &mut BytesMut) -> Result<(PacketType, u8)
             Ok((PacketType::Pubcomp, 0))
         }
         Packet::Subscribe(s) => {
-            encode_subscribe(s, out);
+            encode_subscribe(s, out)?;
             Ok((PacketType::Subscribe, 0b0010))
         }
         Packet::Suback(s) => {
@@ -539,7 +550,7 @@ fn encode_packet_body(p: &Packet, out: &mut BytesMut) -> Result<(PacketType, u8)
             Ok((PacketType::Suback, 0))
         }
         Packet::Unsubscribe(u) => {
-            encode_unsubscribe(u, out);
+            encode_unsubscribe(u, out)?;
             Ok((PacketType::Unsubscribe, 0b0010))
         }
         Packet::Unsuback(id) => {
@@ -552,18 +563,34 @@ fn encode_packet_body(p: &Packet, out: &mut BytesMut) -> Result<(PacketType, u8)
     }
 }
 
-fn put_string(out: &mut BytesMut, s: &str) {
+fn put_string(out: &mut BytesMut, s: &str) -> Result<(), CodecError> {
+    if s.len() > u16::MAX as usize {
+        return Err(CodecError::MalformedBody(format!(
+            "string too long: {} bytes (max {})",
+            s.len(),
+            u16::MAX
+        )));
+    }
     out.put_u16(s.len() as u16);
     out.put_slice(s.as_bytes());
+    Ok(())
 }
 
-fn put_binary(out: &mut BytesMut, b: &[u8]) {
+fn put_binary(out: &mut BytesMut, b: &[u8]) -> Result<(), CodecError> {
+    if b.len() > u16::MAX as usize {
+        return Err(CodecError::MalformedBody(format!(
+            "binary too long: {} bytes (max {})",
+            b.len(),
+            u16::MAX
+        )));
+    }
     out.put_u16(b.len() as u16);
     out.put_slice(b);
+    Ok(())
 }
 
-fn encode_connect(c: &Connect, out: &mut BytesMut) {
-    put_string(out, "MQTT");
+fn encode_connect(c: &Connect, out: &mut BytesMut) -> Result<(), CodecError> {
+    put_string(out, "MQTT")?;
     out.put_u8(c.protocol_level);
 
     let mut flags = ConnectFlags::empty();
@@ -604,25 +631,26 @@ fn encode_connect(c: &Connect, out: &mut BytesMut) {
         out.put_slice(&props_body);
     }
 
-    put_string(out, &c.client_id);
+    put_string(out, &c.client_id)?;
     if let Some(will) = &c.will {
         // MQTT 5.0：遗嘱在 topic 前写 Will Properties 段（轻量：空属性）
         if c.protocol_level == MQTT_5_LEVEL {
             encode_remaining_length(0, out);
         }
-        put_string(out, &will.topic);
-        put_binary(out, &will.message);
+        put_string(out, &will.topic)?;
+        put_binary(out, &will.message)?;
     }
     if let Some(u) = &c.username {
-        put_string(out, u);
+        put_string(out, u)?;
     }
     if let Some(p) = &c.password {
-        put_binary(out, p);
+        put_binary(out, p)?;
     }
+    Ok(())
 }
 
-fn encode_publish(p: &Publish, out: &mut BytesMut) -> u8 {
-    put_string(out, &p.topic);
+fn encode_publish(p: &Publish, out: &mut BytesMut) -> Result<u8, CodecError> {
+    put_string(out, &p.topic)?;
     if let Some(id) = p.packet_id {
         out.put_u16(id);
     }
@@ -636,22 +664,24 @@ fn encode_publish(p: &Publish, out: &mut BytesMut) -> u8 {
     if p.retain {
         flags |= 0b0001;
     }
-    flags
+    Ok(flags)
 }
 
-fn encode_subscribe(s: &Subscribe, out: &mut BytesMut) {
+fn encode_subscribe(s: &Subscribe, out: &mut BytesMut) -> Result<(), CodecError> {
     out.put_u16(s.packet_id);
     for t in &s.topics {
-        put_string(out, &t.topic_filter);
+        put_string(out, &t.topic_filter)?;
         out.put_u8(t.qos.as_u8());
     }
+    Ok(())
 }
 
-fn encode_unsubscribe(u: &Unsubscribe, out: &mut BytesMut) {
+fn encode_unsubscribe(u: &Unsubscribe, out: &mut BytesMut) -> Result<(), CodecError> {
     out.put_u16(u.packet_id);
     for f in &u.topic_filters {
-        put_string(out, f);
+        put_string(out, f)?;
     }
+    Ok(())
 }
 
 // ---------- 便捷构造 ----------

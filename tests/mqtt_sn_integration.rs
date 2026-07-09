@@ -244,8 +244,8 @@ async fn sn_connect_and_connack() -> anyhow::Result<()> {
     let (n, _) = sock.recv_from(&mut buf).await?;
     let (msg_type, body) = parse_sn(&buf[..n]).unwrap();
     assert_eq!(msg_type, MSG_CONNACK);
-    // CONNACK: Flags, ReturnCode
-    assert_eq!(body[1], RC_ACCEPTED, "CONNACK return code should be accepted");
+    // CONNACK: ReturnCode（MQTT-SN 规范：Length | MsgType | ReturnCode，无 Flags 字节）
+    assert_eq!(body[0], RC_ACCEPTED, "CONNACK return code should be accepted");
 
     // PINGREQ → PINGRESP
     sock.send(&encode_pingreq()).await?;
