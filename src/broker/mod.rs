@@ -302,10 +302,11 @@ impl BrokerState {
         self.security.on_connect(peer);
 
         // 运行连接生命周期；无论以何种方式退出，都需通知安全中间件扣减 IP 计数
+        let mut client_id_out: Option<String> = None;
         let result = self
-            .handle_connection_inner(socket, peer, &mut shutdown)
+            .handle_connection_inner(socket, peer, &mut shutdown, &mut client_id_out)
             .await;
-        self.security.on_disconnect(peer, None);
+        self.security.on_disconnect(peer, client_id_out.as_deref());
         result
     }
 
@@ -314,6 +315,7 @@ impl BrokerState {
         socket: S,
         peer: SocketAddr,
         shutdown: &mut ShutdownRx,
+        client_id_out: &mut Option<String>,
     ) -> BrokerResult<()>
     where
         S: AsyncRead + AsyncWrite + Unpin,
@@ -383,6 +385,8 @@ impl BrokerState {
         ctx.authenticated = true;
         ctx.username = identity.username;
         ctx.touch();
+        // 记录 client_id 供外层在断开时清理令牌桶
+        *client_id_out = Some(client_id.clone());
 
         // 5. 注册会话（含接管旧连接 + 取回离线消息）
         // MQTT 5.0：提取 Session Expiry Interval（仅 clean=false 生效）
@@ -612,6 +616,7 @@ impl BrokerState {
                     my_filters.remove(f);
                     debug!(client = %client_id, filter = %f, "unsubscribed");
                 }
+                METRICS.inc_unsubscribe();
                 sink.send(Packet::Unsuback(packet_id)).await?;
                 // 订阅列表变更：同步落盘会话快照
                 self.persist_session_snapshot(client_id);
@@ -704,13 +709,6 @@ impl BrokerState {
             }
         };
 
-        METRICS.inc_publish();
-        METRICS.inc_publish_qos(match p.qos {
-            QoS::AtMostOnce => 0,
-            QoS::AtLeastOnce => 1,
-            QoS::ExactlyOnce => 2,
-        });
-
         // 生成轻量 TraceID，贯穿路由→投递链路（便于 grep 定位单条消息流向）
         let trace_id = crate::utils::time::trace_id();
         debug!(%trace_id, client = %client_id, topic = %p.topic, ?p.qos, payload_len = p.payload.len(), "PUBLISH received");
@@ -732,6 +730,13 @@ impl BrokerState {
         };
 
         if should_route {
+            // 仅在消息未被拒绝时计数，避免被拒绝的消息也统计在 publish_received 中
+            METRICS.inc_publish();
+            METRICS.inc_publish_qos(match p.qos {
+                QoS::AtMostOnce => 0,
+                QoS::AtLeastOnce => 1,
+                QoS::ExactlyOnce => 2,
+            });
             self.router.route_inbound_publish(&p, Some(client_id), &trace_id)?;
             // 消息插件：HTTP 转发 hook（非阻塞，仅 try_send 到后台队列）
             // 仅在通过所有检查并已路由后才转发，避免转发被拒绝的消息

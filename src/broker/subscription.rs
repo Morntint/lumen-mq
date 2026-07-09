@@ -263,6 +263,15 @@ impl SubscriptionTree {
         n
     }
 
+    /// 返回 (普通订阅数, 共享订阅成员数) 分别的计数
+    pub fn subscription_counts(&self) -> (usize, usize) {
+        let root = self.root.read();
+        let normal = count_subscribers(&root);
+        let shared = self.shared.read();
+        let shared_count: usize = shared.values().map(|e| e.members.len()).sum();
+        (normal, shared_count)
+    }
+
     /// 获取某客户端的全部订阅 (filter, qos)，用于持久化快照
     pub fn subscriptions_of(&self, client_id: &str) -> Vec<(String, QoS)> {
         self.reverse.read().get(client_id).cloned().unwrap_or_default()

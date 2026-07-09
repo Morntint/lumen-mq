@@ -80,10 +80,11 @@ impl RetainStore {
                 payload,
                 qos,
             };
-            // 落盘写入（先落盘后写内存：失败时不污染内存）
+            // 落盘写入（先落盘后写内存：失败时不污染内存，避免内存与磁盘不一致）
             if let Some(s) = &self.storage {
                 if let Err(e) = s.save_retained(topic, &msg) {
-                    tracing::warn!(error = %e, %topic, "persist save_retained failed");
+                    tracing::warn!(error = %e, %topic, "persist save_retained failed, skipping memory write");
+                    return;
                 }
             }
             map.insert(topic.to_string(), msg);

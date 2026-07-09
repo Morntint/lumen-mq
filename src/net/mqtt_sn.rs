@@ -58,6 +58,8 @@ const RC_ACCEPTED: u8 = 0x00;
 const RC_CONGESTION: u8 = 0x01;
 const RC_INVALID_TOPIC_ID: u8 = 0x02;
 const RC_NOT_SUPPORTED: u8 = 0x03;
+/// 拒绝（规范未定义专用码，0xFF 为业界通用拒绝码）
+const RC_REJECTED: u8 = 0xFF;
 
 /// MQTT-SN 协议 ID（1.1）
 const PROTOCOL_ID_MQTTSN: u8 = 0x01;
@@ -346,11 +348,15 @@ fn encode_packet(p: &SnPacket) -> Vec<u8> {
     if total <= 0xFF {
         out[0] = total as u8;
     } else {
-        // 长格式：0x01 + 2 字节大端长度
+        // 长格式：0x01 + 2 字节大端长度 + 内容
+        // 长度字段值 = 整个报文的总字节数（含 0x01 前缀和 2 字节长度字段本身）
+        // total = 1(占位) + type + body = 1 + content
+        // 报文总长 = 1(0x01) + 2(length) + content = 3 + (total - 1) = total + 2
+        let packet_len = (total + 2) as u16;
         let mut long = Vec::with_capacity(total + 2);
         long.push(0x01);
-        long.extend_from_slice(&(total as u16).to_be_bytes());
-        // out[0] 已被占用为长度占位；这里 out[1..] 才是真实内容
+        long.extend_from_slice(&packet_len.to_be_bytes());
+        // out[0] 是短格式占位长度，out[1..] 才是真实内容（type + body）
         long.extend_from_slice(&out[1..]);
         return long;
     }
@@ -486,7 +492,7 @@ impl MqttSnServer {
                                     return None;
                                 }
                                 let limit = Duration::from_secs(
-                                    (e.keep_alive_secs as u64).max(1) * 3 / 2,
+                                    ((e.keep_alive_secs as u64).max(1) * 3).div_ceil(2),
                                 );
                                 if now.duration_since(e.last_seen) > limit {
                                     Some((e.peer, e.client_id.clone(), e.epoch, e.clean))
@@ -554,12 +560,13 @@ impl MqttSnServer {
         socket: &Arc<UdpSocket>,
         broker: &Arc<BrokerState>,
         clients: &Arc<DashMap<SocketAddr, SnClient>>,
-        next_topic_id: &AtomicU16,
+        next_topic_id: &Arc<AtomicU16>,
     ) {
         match pkt {
             SnPacket::Connect { flags, protocol_id, duration, client_id } => {
                 Self::handle_connect(
                     broker, clients, socket, peer, flags, protocol_id, duration, client_id,
+                    next_topic_id.clone(),
                 ).await;
             }
             SnPacket::Register { flags: _, topic_id: _, msg_id, topic_name } => {
@@ -607,6 +614,7 @@ impl MqttSnServer {
                 } else {
                     SnPacket::Unsuback { msg_id }
                 };
+                METRICS.inc_unsubscribe();
                 send(socket, peer, &resp).await;
             }
             SnPacket::Pingreq => {
@@ -615,10 +623,25 @@ impl MqttSnServer {
                 }
                 send(socket, peer, &SnPacket::Pingresp).await;
             }
-            SnPacket::Disconnect { duration: _ } => {
-                debug!(%peer, "MQTT-SN client disconnected");
-                if let Some((_, c)) = clients.remove(&peer) {
-                    cleanup_session(broker, &c.client_id, c.epoch, c.clean);
+            SnPacket::Disconnect { duration } => {
+                match duration {
+                    Some(d) => {
+                        // 睡眠态：标记会话离线（消息入离线队列），保留会话订阅以便唤醒后恢复
+                        debug!(%peer, sleep_secs = d, "MQTT-SN client entering sleep state");
+                        if let Some((_, c)) = clients.remove(&peer) {
+                            if broker.sessions().owns(&c.client_id, c.epoch) {
+                                broker.sessions().mark_offline(&c.client_id, c.epoch);
+                            }
+                            METRICS.dec_connections();
+                        }
+                    }
+                    None => {
+                        // 真正断开：清理会话（clean=true 删除订阅；clean=false 标记离线）
+                        debug!(%peer, "MQTT-SN client disconnected");
+                        if let Some((_, c)) = clients.remove(&peer) {
+                            cleanup_session(broker, &c.client_id, c.epoch, c.clean);
+                        }
+                    }
                 }
             }
             // 以下为客户端→网关方向不应主动发送，或本实现忽略
@@ -649,6 +672,7 @@ impl MqttSnServer {
         protocol_id: u8,
         duration: u16,
         client_id: String,
+        next_topic_id: Arc<AtomicU16>,
     ) {
         // 协议版本校验
         if protocol_id != PROTOCOL_ID_MQTTSN {
@@ -663,7 +687,7 @@ impl MqttSnServer {
             return;
         }
         if client_id.is_empty() {
-            send(socket, peer, &SnPacket::Connack { return_code: RC_INVALID_TOPIC_ID }).await;
+            send(socket, peer, &SnPacket::Connack { return_code: RC_REJECTED }).await;
             return;
         }
 
@@ -704,7 +728,7 @@ impl MqttSnServer {
         let socket_cloned = socket.clone();
         let clients_cloned = clients.clone();
         tokio::spawn(async move {
-            forward_outbound(rx, socket_cloned, peer, client_id.clone(), clients_cloned).await;
+            forward_outbound(rx, socket_cloned, peer, client_id.clone(), clients_cloned, next_topic_id).await;
         });
     }
 
@@ -864,19 +888,14 @@ async fn forward_outbound(
     peer: SocketAddr,
     client_id: String,
     clients: Arc<DashMap<SocketAddr, SnClient>>,
+    next_topic_id: Arc<AtomicU16>,
 ) {
     while let Some(msg) = rx.recv().await {
         let (topic_id, msg_id, qos) = match clients.get_mut(&peer) {
             Some(mut c) => {
                 // 复用既有主题 ID；若该主题未被客户端 REGISTER/SUBSCRIBE，则现分配一个
-                let tid = if let Some(&id) = c.topic_to_id.get(&msg.topic) {
-                    id
-                } else {
-                    let new_id = allocate_global_topic_id(&c.topic_to_id);
-                    c.topic_to_id.insert(msg.topic.clone(), new_id);
-                    c.id_to_topic.insert(new_id, msg.topic.clone());
-                    new_id
-                };
+                // 使用全局原子计数器 assign_topic_id，避免线性扫描与跨客户端 ID 冲突
+                let tid = c.assign_topic_id(&msg.topic, &next_topic_id);
                 let mid = if msg.qos != QoS::AtMostOnce {
                     Some(c.allocate_msg_id())
                 } else {
@@ -911,17 +930,6 @@ async fn forward_outbound(
         }
     }
     debug!(%peer, client = %client_id, "MQTT-SN forwarder exited");
-}
-
-/// 在客户端既有映射基础上分配一个未使用的主题 ID
-fn allocate_global_topic_id(existing: &HashMap<String, u16>) -> u16 {
-    let used: std::collections::HashSet<u16> = existing.values().copied().collect();
-    for id in TOPIC_ID_MIN..=TOPIC_ID_MAX {
-        if !used.contains(&id) {
-            return id;
-        }
-    }
-    TOPIC_ID_MIN
 }
 
 /// 清理 SN 客户端会话（clean=true 删除订阅与会话；clean=false 标记离线）

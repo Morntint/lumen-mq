@@ -170,7 +170,16 @@ async fn health(State(broker): State<Arc<BrokerState>>) -> Json<HealthResponse> 
     })
 }
 
-async fn metrics() -> Response {
+async fn metrics(State(broker): State<Arc<BrokerState>>) -> Response {
+    // 同步 gauge 指标（订阅数 / 会话数），确保 Prometheus 导出值准确
+    let (normal_subs, shared_subs) = broker.subscriptions().subscription_counts();
+    METRICS.set_subscriptions(normal_subs as i64);
+    METRICS.set_shared_subscriptions(shared_subs as i64);
+    let total_sessions = broker.sessions().total_count();
+    let online_sessions = broker.sessions().online_count();
+    METRICS.set_sessions_total(total_sessions as i64);
+    METRICS.set_sessions_offline((total_sessions.saturating_sub(online_sessions)) as i64);
+
     let text = METRICS.prometheus_text();
     (
         StatusCode::OK,
@@ -374,6 +383,15 @@ async fn handle_ws_dashboard(mut socket: WebSocket, broker: Arc<BrokerState>) {
 
 /// 构建一次仪表盘快照
 fn build_dashboard_snapshot(broker: &BrokerState) -> DashboardSnapshot {
+    // 从实际数据结构同步 gauge 指标（订阅数 / 会话数），避免指标永远为 0
+    let (normal_subs, shared_subs) = broker.subscriptions().subscription_counts();
+    METRICS.set_subscriptions(normal_subs as i64);
+    METRICS.set_shared_subscriptions(shared_subs as i64);
+    let total_sessions = broker.sessions().total_count();
+    let online_sessions = broker.sessions().online_count();
+    METRICS.set_sessions_total(total_sessions as i64);
+    METRICS.set_sessions_offline((total_sessions.saturating_sub(online_sessions)) as i64);
+
     let metrics = METRICS.snapshot();
     let snap = broker.sessions().iter_snapshot();
     let sessions = snap
