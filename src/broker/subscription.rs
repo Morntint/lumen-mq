@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use parking_lot::RwLock;
@@ -33,12 +34,21 @@ impl Node {
 }
 
 /// 共享订阅条目：组成员表 + 轮询计数器
-#[derive(Default)]
 struct SharedEntry {
     /// client_id -> qos
     members: HashMap<String, QoS>,
     /// 轮询投递计数器（取模成员数选择）
-    rr_counter: u64,
+    /// AtomicU64：matches_shared 读路径只需 read()，无需写锁
+    rr_counter: AtomicU64,
+}
+
+impl Default for SharedEntry {
+    fn default() -> Self {
+        Self {
+            members: HashMap::new(),
+            rr_counter: AtomicU64::new(0),
+        }
+    }
 }
 
 /// 主题订阅树，支持 `+` / `#` 通配符 + `$share/{group}/{filter}` 共享订阅
@@ -228,14 +238,16 @@ impl SubscriptionTree {
 
     /// 匹配共享订阅：对每个 (group, filter) 组，若 topic 匹配 filter，
     /// 则在组内轮询选一个成员投递。返回选中的 (client_id, qos) 列表。
+    ///
+    /// 使用读锁 + AtomicU64 实现轮询计数器，避免写锁成为大共享订阅的吞吐瓶颈。
     pub fn matches_shared(&self, topic: &str) -> Vec<(String, QoS)> {
         if topic.is_empty() {
             return Vec::new();
         }
-        let mut shared = self.shared.write();
+        let shared = self.shared.read();
         let mut selected: Vec<(String, QoS)> = Vec::new();
 
-        for ((_, filter), entry) in shared.iter_mut() {
+        for ((_, filter), entry) in shared.iter() {
             if !topic_matches_filter(topic, filter) {
                 continue;
             }
@@ -245,8 +257,9 @@ impl SubscriptionTree {
             // 收集成员并排序以保证轮询确定性
             let mut members: Vec<(&String, &QoS)> = entry.members.iter().collect();
             members.sort_by(|a, b| a.0.cmp(b.0));
-            let idx = (entry.rr_counter % members.len() as u64) as usize;
-            entry.rr_counter = entry.rr_counter.wrapping_add(1);
+            // fetch_add 原子获取当前值并递增，无需写锁
+            let counter = entry.rr_counter.fetch_add(1, Ordering::Relaxed);
+            let idx = (counter % members.len() as u64) as usize;
             let (cid, qos) = members[idx];
             selected.push((cid.clone(), *qos));
         }
@@ -327,20 +340,42 @@ fn remove_recursive(node: &mut Node, segs: &[&str], idx: usize, client_id: &str)
             .as_mut()
             .map(|c| remove_recursive(c, segs, idx + 1, client_id))
             .unwrap_or(false),
-        s => node
-            .children
-            .get_mut(s)
-            .map(|c| remove_recursive(c, segs, idx + 1, client_id))
-            .unwrap_or(false),
+        s => {
+            // 先取出 child 引用做递归；递归后若 child 为空则从 children 移除
+            let (removed, should_prune) = {
+                let child = match node.children.get_mut(s) {
+                    Some(c) => c,
+                    None => return false,
+                };
+                let removed = remove_recursive(child, segs, idx + 1, client_id);
+                (removed, removed && is_empty(child))
+            };
+            if should_prune {
+                node.children.remove(s);
+            }
+            // 返回"是否实际移除了订阅者"，而非"是否裁剪了节点"，
+            // 供调用方决定是否更新反向索引
+            return removed;
+        }
     };
-    // 清理空子节点（保守清理，避免内存增长）
+    // 递归清理空子节点（plus_child / hash_child），避免内存单调增长
     if removed {
-        if let "+" = seg {
-            if let Some(c) = &node.plus_child {
-                if is_empty(c) {
-                    node.plus_child = None;
+        match seg {
+            "+" => {
+                if let Some(c) = &node.plus_child {
+                    if is_empty(c) {
+                        node.plus_child = None;
+                    }
                 }
             }
+            "#" => {
+                if let Some(c) = &node.hash_child {
+                    if is_empty(c) {
+                        node.hash_child = None;
+                    }
+                }
+            }
+            _ => {}
         }
     }
     removed

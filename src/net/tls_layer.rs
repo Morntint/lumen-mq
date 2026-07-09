@@ -20,7 +20,7 @@ use rustls_pemfile::{certs, private_key};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio_rustls::TlsAcceptor;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 use crate::broker::BrokerState;
 use crate::config::TlsConfig;
@@ -28,11 +28,13 @@ use crate::utils::{BrokerError, BrokerResult};
 
 /// 安装 rustls ring 加密后端为进程默认（多次调用安全，仅首次生效）
 fn install_default_crypto_provider() {
-    // install_default 返回 Err 表示已被安装（正常）或安装失败（异常）
+    // 先检查是否已安装（其他模块可能已安装过）；已安装时无需任何操作
+    if rustls::crypto::CryptoProvider::get_default().is_some() {
+        return;
+    }
+    // 未安装则尝试安装；安装失败（如内存分配异常）才告警
     if let Err(e) = rustls::crypto::ring::default_provider().install_default() {
-        // 已安装是预期行为（多模块初始化），仅对真正的安装失败告警
-        // rustls 的 CryptoProvider::install_default 已安装时返回 Err 但不携带具体原因
-        debug!(error = ?e, "rustls crypto provider already installed or install failed (may be harmless if already installed)");
+        error!(error = ?e, "rustls ring crypto provider install failed");
     }
 }
 
@@ -150,10 +152,20 @@ impl TlsServer {
                             continue;
                         }
                     };
+
+                    // 预置安全检查：accept 后立即校验 IP 黑白名单，
+                    // 命中则直接关闭，避免 TLS 握手消耗资源
+                    if let Err(e) = self.broker.security().check_connection(peer) {
+                        warn!(peer = %peer, error = %e, "TLS accept rejected by security guard");
+                        drop(socket);
+                        continue;
+                    }
+
                     let current = self.broker.metrics().connections_current
                         .load(std::sync::atomic::Ordering::Relaxed);
-                    if current as usize >= self.max_connections {
-                        warn!(peer = %peer, current, max = self.max_connections, "max connections reached, refusing TLS");
+                    let pending = self.broker.metrics().pending_connections();
+                    if (current + pending) as usize >= self.max_connections {
+                        warn!(peer = %peer, current, pending, max = self.max_connections, "max connections reached (incl. pending), refusing TLS");
                         drop(socket);
                         continue;
                     }
@@ -164,15 +176,21 @@ impl TlsServer {
                     let shutdown_rx = self.shutdown.clone();
 
                     tokio::spawn(async move {
-                        // 先完成 TLS 握手
-                        match acceptor.accept(socket).await {
-                            Ok(tls_stream) => {
+                        // 先完成 TLS 握手（10s 超时，避免慢速攻击者耗尽任务栈）
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(10),
+                            acceptor.accept(socket),
+                        ).await {
+                            Ok(Ok(tls_stream)) => {
                                 let _ = broker
                                     .handle_connection(tls_stream, peer, shutdown_rx)
                                     .await;
                             }
-                            Err(e) => {
+                            Ok(Err(e)) => {
                                 warn!(error = %e, %peer, "TLS handshake failed");
+                            }
+                            Err(_) => {
+                                warn!(%peer, "TLS handshake timeout (10s), closing");
                             }
                         }
                     });

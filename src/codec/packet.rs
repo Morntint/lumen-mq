@@ -1,4 +1,5 @@
 use bitflags::bitflags;
+use bytes::Bytes;
 use std::fmt;
 
 use crate::utils::CodecError;
@@ -193,7 +194,9 @@ pub struct Publish {
     pub retain: bool,
     pub topic: String,
     pub packet_id: Option<u16>,
-    pub payload: Vec<u8>,
+    /// 载荷使用 `bytes::Bytes` 实现廉价引用计数克隆，
+    /// 广播给大量订阅者时避免逐个全量拷贝
+    pub payload: Bytes,
 }
 
 #[derive(Debug, Clone)]

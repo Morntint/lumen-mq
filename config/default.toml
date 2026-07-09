@@ -123,3 +123,7 @@ topic_filter = ""
 timeout_secs = 5
 # 转发队列最大长度（溢出时丢弃最旧消息，防 OOM）
 max_queue = 1024
+# 允许转发到私有/环回/链路本地地址（SSRF 防护豁免）
+# 默认 false：拒绝 127.0.0.0/8、RFC1918、169.254.0.0/16、fc00::/7 等内网地址
+# 工业场景下若转发目标确实是内网 webhook 服务，可显式置 true 放行
+allow_private_network = false

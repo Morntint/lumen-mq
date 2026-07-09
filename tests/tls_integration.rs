@@ -6,6 +6,8 @@
 //! - 单向 TLS（服务端证书，客户端校验）
 //! - load_tls_acceptor 错误路径（证书文件缺失/非法）
 
+#![allow(clippy::field_reassign_with_default)]
+
 use std::io::BufReader;
 use std::sync::Arc;
 use std::time::Duration;

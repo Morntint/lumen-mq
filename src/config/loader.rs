@@ -96,19 +96,39 @@ fn apply_env_overrides(value: &mut toml::Value) {
     use toml::Value::*;
     let Some(tbl) = value.as_table_mut() else { return };
 
+    // 辅助：在 tbl 下取/建一个子 table，若已存在但非 table 类型则 warn 并跳过，
+    // 避免 panic（default.toml 中误把 section 写成标量时不应崩溃）
+    macro_rules! get_sub_table {
+        ($key:expr) => {{
+            let entry = tbl
+                .entry($key)
+                .or_insert_with(|| Table(Default::default()));
+            match entry.as_table_mut() {
+                Some(t) => Some(t),
+                None => {
+                    tracing::warn!(
+                        key = $key,
+                        "config section is not a table, skipping env override"
+                    );
+                    None
+                }
+            }
+        }};
+    }
+
     if let Ok(bind) = std::env::var("LUMENMQ_TCP_BIND") {
-        tbl.entry("tcp").or_insert_with(|| Table(Default::default()))
-            .as_table_mut().expect("tcp is table")
-            .insert("bind".into(), String(bind));
+        if let Some(t) = get_sub_table!("tcp") {
+            t.insert("bind".into(), String(bind));
+        }
     }
     if let Ok(level) = std::env::var("LUMENMQ_LOG_LEVEL") {
-        tbl.entry("log").or_insert_with(|| Table(Default::default()))
-            .as_table_mut().expect("log is table")
-            .insert("level".into(), String(level));
+        if let Some(t) = get_sub_table!("log") {
+            t.insert("level".into(), String(level));
+        }
     }
     if let Ok(node) = std::env::var("LUMENMQ_NODE_ID") {
-        tbl.entry("broker").or_insert_with(|| Table(Default::default()))
-            .as_table_mut().expect("broker is table")
-            .insert("node_id".into(), String(node));
+        if let Some(t) = get_sub_table!("broker") {
+            t.insert("node_id".into(), String(node));
+        }
     }
 }

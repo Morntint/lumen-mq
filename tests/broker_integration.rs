@@ -7,6 +7,8 @@
 //! - 遗嘱消息触发
 //! - 阶段三：sled 持久化（broker 重启后恢复会话订阅 + 离线消息 + retained）
 
+#![allow(clippy::field_reassign_with_default)]
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -197,7 +199,7 @@ async fn qos2_full_handshake_inbound_and_outbound() -> anyhow::Result<()> {
         retain: false,
         topic: "a/b".into(),
         packet_id: Some(100),
-        payload: b"hello-qos2".to_vec(),
+        payload: bytes::Bytes::from_static(b"hello-qos2"),
     })).await?;
 
     // 3. 发布者应收到 PUBREC → 发 PUBREL → 收 PUBCOMP
@@ -213,7 +215,7 @@ async fn qos2_full_handshake_inbound_and_outbound() -> anyhow::Result<()> {
         Packet::Publish(Publish { qos, packet_id, payload, topic, .. }) => {
             assert_eq!(qos, QoS::ExactlyOnce);
             assert_eq!(topic, "a/b");
-            assert_eq!(payload, b"hello-qos2");
+            assert_eq!(&payload[..], b"hello-qos2");
             packet_id.unwrap()
         }
         other => panic!("expected PUBLISH, got {other:?}"),
@@ -251,7 +253,7 @@ async fn qos2_inbound_duplicate_dropped() -> anyhow::Result<()> {
             retain: false,
             topic: "dup/x".into(),
             packet_id: Some(200),
-            payload: b"dup".to_vec(),
+            payload: bytes::Bytes::from_static(b"dup"),
         })).await?;
         // 每次都应收到 PUBREC
         let pubrec = pub_.recv().await?;
@@ -288,7 +290,7 @@ async fn retain_message_delivered_to_new_subscriber() -> anyhow::Result<()> {
         retain: true,
         topic: "sensor/ret".into(),
         packet_id: Some(10),
-        payload: b"retained-value".to_vec(),
+        payload: bytes::Bytes::from_static(b"retained-value"),
     })).await?;
     let puback = pub_.recv().await?;
     assert!(matches!(puback, Packet::Puback(10)));
@@ -307,7 +309,7 @@ async fn retain_message_delivered_to_new_subscriber() -> anyhow::Result<()> {
     match retained {
         Packet::Publish(Publish { topic, payload, retain, qos, .. }) => {
             assert_eq!(topic, "sensor/ret");
-            assert_eq!(payload, b"retained-value");
+            assert_eq!(&payload[..], b"retained-value");
             assert!(retain, "retained delivery must set retain=1");
             assert_eq!(qos, QoS::AtLeastOnce);
         }
@@ -347,7 +349,7 @@ async fn offline_message_replayed_on_reconnect() -> anyhow::Result<()> {
         retain: false,
         topic: "off/msg".into(),
         packet_id: Some(50),
-        payload: b"offline-msg".to_vec(),
+        payload: bytes::Bytes::from_static(b"offline-msg"),
     })).await?;
     let _ = pub_.recv().await; // PUBACK
 
@@ -367,7 +369,7 @@ async fn offline_message_replayed_on_reconnect() -> anyhow::Result<()> {
     match replayed {
         Packet::Publish(Publish { topic, payload, qos, .. }) => {
             assert_eq!(topic, "off/msg");
-            assert_eq!(payload, b"offline-msg");
+            assert_eq!(&payload[..], b"offline-msg");
             assert_eq!(qos, QoS::AtLeastOnce);
         }
         other => panic!("expected replayed PUBLISH, got {other:?}"),
@@ -407,7 +409,7 @@ async fn last_will_fired_on_abnormal_disconnect() -> anyhow::Result<()> {
     match will_msg {
         Some(Packet::Publish(Publish { topic, payload, .. })) => {
             assert_eq!(topic, "will/topic");
-            assert_eq!(payload, b"client-dead");
+            assert_eq!(&payload[..], b"client-dead");
         }
         other => panic!("expected will PUBLISH, got {other:?}"),
     }
@@ -485,7 +487,7 @@ async fn persistence_survives_broker_restart() -> anyhow::Result<()> {
         retain: true,
         topic: "persist/topic".into(),
         packet_id: Some(700),
-        payload: b"retained-persist".to_vec(),
+        payload: bytes::Bytes::from_static(b"retained-persist"),
     })).await?;
     let _ = pub_.recv().await?; // PUBACK
     disconnect(pub_).await;
@@ -520,7 +522,7 @@ async fn persistence_survives_broker_restart() -> anyhow::Result<()> {
     match replayed {
         Some(Packet::Publish(Publish { topic, payload, .. })) => {
             assert_eq!(topic, "persist/topic");
-            assert_eq!(payload, b"retained-persist");
+            assert_eq!(&payload[..], b"retained-persist");
         }
         other => panic!("expected replayed offline PUBLISH, got {other:?}"),
     }
@@ -537,7 +539,7 @@ async fn persistence_survives_broker_restart() -> anyhow::Result<()> {
     match retained {
         Some(Packet::Publish(Publish { topic, payload, retain, .. })) => {
             assert_eq!(topic, "persist/topic");
-            assert_eq!(payload, b"retained-persist");
+            assert_eq!(&payload[..], b"retained-persist");
             assert!(retain, "retained delivery must set retain=1");
         }
         other => panic!("expected retained PUBLISH after restart, got {other:?}"),

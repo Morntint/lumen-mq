@@ -27,10 +27,8 @@ impl Authenticator {
         password: Option<&[u8]>,
     ) -> Result<AuthIdentity, AuthError> {
         // client_id 合法性
-        if client_id.is_empty() {
-            // MQTT 允许空 client_id 仅当 clean_session=true；此处简化为拒绝
-            return Err(AuthError::UnauthorizedClientId);
-        }
+        // 空 client_id 由 broker 在调用 auth 前处理（clean=true 时分配 UUID，
+        // clean=false 时拒绝）；此处仅校验长度上限
         if client_id.len() > 65535 {
             return Err(AuthError::UnauthorizedClientId);
         }
@@ -57,8 +55,14 @@ impl Authenticator {
                     None => return Err(AuthError::BadCredentials),
                 };
 
-                // 简单明文比对（阶段四接入加盐哈希 / token 验签）
-                if user.password.as_bytes() != password {
+                // 拒绝空密码配置（防止 config 中 password="" 导致无密码登录）
+                if user.password.is_empty() {
+                    tracing::warn!(username = %username, "configured user has empty password, rejecting");
+                    return Err(AuthError::BadCredentials);
+                }
+
+                // 常数时间比对，避免计时侧信道泄露密码
+                if !constant_time_eq(user.password.as_bytes(), password) {
                     return Err(AuthError::BadCredentials);
                 }
                 Ok(AuthIdentity {
@@ -96,4 +100,16 @@ impl From<&LastWill> for WillMessage {
             retain: w.retain,
         }
     }
+}
+
+/// 常数时间字节序列比较，避免计时侧信道泄露密码 / token
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }

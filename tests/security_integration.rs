@@ -8,6 +8,9 @@
 //! - 载荷长度限制
 //! - 热更新：运行期修改黑名单即时生效
 
+#![allow(clippy::field_reassign_with_default)]
+#![allow(clippy::match_like_matches_macro)]
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -148,7 +151,7 @@ async fn publish_rate_limit_rejects_excess() -> anyhow::Result<()> {
             retain: false,
             topic: "rate/test".into(),
             packet_id: Some(i + 1),
-            payload: format!("msg-{i}").into_bytes(),
+            payload: bytes::Bytes::from(format!("msg-{i}").into_bytes()),
         }))
         .await?;
     }
@@ -182,7 +185,7 @@ async fn payload_size_limit_rejects_oversized() -> anyhow::Result<()> {
         retain: false,
         topic: "size/test".into(),
         packet_id: Some(1),
-        payload: b"short".to_vec(),
+        payload: bytes::Bytes::from_static(b"short"),
     }))
     .await?;
     let _ = tokio::time::timeout(Duration::from_secs(1), c.recv()).await?;
@@ -193,7 +196,7 @@ async fn payload_size_limit_rejects_oversized() -> anyhow::Result<()> {
         retain: false,
         topic: "size/test".into(),
         packet_id: Some(2),
-        payload: vec![b'x'; 100],
+        payload: bytes::Bytes::from(vec![b'x'; 100]),
     }))
     .await?;
     let _ = tokio::time::timeout(Duration::from_secs(1), c.recv()).await?;
@@ -217,7 +220,7 @@ async fn reload_security_takes_effect() -> anyhow::Result<()> {
         retain: false,
         topic: "r/t".into(),
         packet_id: Some(1),
-        payload: b"before".to_vec(),
+        payload: bytes::Bytes::from_static(b"before"),
     }))
     .await?;
     let _ = tokio::time::timeout(Duration::from_secs(1), c1.recv()).await?;
@@ -238,7 +241,7 @@ async fn reload_security_takes_effect() -> anyhow::Result<()> {
             retain: false,
             topic: "r/t".into(),
             packet_id: Some(i + 10),
-            payload: b"after".to_vec(),
+            payload: bytes::Bytes::from_static(b"after"),
         }))
         .await?;
     }
@@ -249,7 +252,7 @@ async fn reload_security_takes_effect() -> anyhow::Result<()> {
         retain: false,
         topic: "r/t".into(),
         packet_id: Some(99),
-        payload: b"after".to_vec(),
+        payload: bytes::Bytes::from_static(b"after"),
     }))
     .await?;
     let mut acks = 0u32;

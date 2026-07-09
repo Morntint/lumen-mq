@@ -47,9 +47,19 @@ impl TcpServer {
                             continue;
                         }
                     };
+
+                    // 预置安全检查：accept 后立即校验 IP 黑白名单，
+                    // 命中则直接关闭，避免 spawn 任务 + CONNECT 读取消耗资源
+                    if let Err(e) = self.broker.security().check_connection(peer) {
+                        warn!(peer = %peer, error = %e, "TCP accept rejected by security guard");
+                        drop(socket);
+                        continue;
+                    }
+
                     let current = self.broker.metrics().connections_current.load(std::sync::atomic::Ordering::Relaxed);
-                    if current as usize >= self.max_connections {
-                        warn!(peer = %peer, current, max = self.max_connections, "max connections reached, refusing");
+                    let pending = self.broker.metrics().pending_connections();
+                    if (current + pending) as usize >= self.max_connections {
+                        warn!(peer = %peer, current, pending, max = self.max_connections, "max connections reached (incl. pending), refusing");
                         drop(socket);
                         continue;
                     }

@@ -151,7 +151,10 @@ async fn main() {
     }
 
     // MQTT 5.0 会话过期后台扫描（每 30s 清理一次 session_expiry 到期的离线会话）
-    let _sweeper = broker.clone().spawn_session_expiry_sweeper(std::time::Duration::from_secs(30));
+    let sweeper_handle = broker.clone().spawn_session_expiry_sweeper(
+        std::time::Duration::from_secs(30),
+        shutdown_rx.clone(),
+    );
     info!("session expiry sweeper task spawned (interval=30s)");
 
     // 6. 信号监听：Ctrl+C / SIGTERM 触发优雅关闭
@@ -165,6 +168,20 @@ async fn main() {
     // 7. 等待所有服务退出
     for h in handles {
         let _ = h.await;
+    }
+    // 等待 sweeper 退出（最多 2 秒，避免卡死关停）
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), sweeper_handle).await;
+
+    // 8. 优雅关停持久化存储：flush 未落盘数据到磁盘
+    // sled::Db::flush() 会同步等待磁盘持久化（阻塞 IO），不能直接在 async 上下文调用，
+    // 否则会卡住 tokio 运行时；用 spawn_blocking 把它转移到阻塞线程池执行。
+    if let Some(storage) = broker.storage() {
+        let storage = storage.clone();
+        match tokio::task::spawn_blocking(move || storage.flush()).await {
+            Ok(Ok(())) => info!("storage flushed on shutdown"),
+            Ok(Err(e)) => error!(error = %e, "flush storage on shutdown failed"),
+            Err(e) => error!(error = %e, "flush storage task join failed"),
+        }
     }
     info!("LumenMQ stopped, bye");
 }

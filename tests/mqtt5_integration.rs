@@ -7,6 +7,8 @@
 //! - Session Expiry：expiry=0 时 clean=false 会话立即清理；expiry>0 保留
 //! - MQTT 5.0 客户端与 3.1.1 客户端共存
 
+#![allow(clippy::field_reassign_with_default)]
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -186,7 +188,7 @@ async fn mqtt5_and_v311_coexist() -> anyhow::Result<()> {
         retain: false,
         topic: "coexist/test".into(),
         packet_id: None,
-        payload: b"cross-version".to_vec(),
+        payload: bytes::Bytes::from_static(b"cross-version"),
     }))
     .await?;
 
@@ -194,7 +196,7 @@ async fn mqtt5_and_v311_coexist() -> anyhow::Result<()> {
     match inbound {
         Packet::Publish(Publish { topic, payload, .. }) => {
             assert_eq!(topic, "coexist/test");
-            assert_eq!(payload, b"cross-version");
+            assert_eq!(&payload[..], b"cross-version");
         }
         other => panic!("expected PUBLISH, got {other:?}"),
     }
@@ -243,7 +245,7 @@ async fn shared_subscription_one_of_two_receives() -> anyhow::Result<()> {
         retain: false,
         topic: "job/x".into(),
         packet_id: None,
-        payload: b"shared-job".to_vec(),
+        payload: bytes::Bytes::from_static(b"shared-job"),
     }))
     .await?;
 
@@ -259,7 +261,7 @@ async fn shared_subscription_one_of_two_receives() -> anyhow::Result<()> {
         (None, Some(Packet::Publish(p))) => p.payload,
         _ => panic!("unexpected packet pattern"),
     };
-    assert_eq!(received_payload, b"shared-job");
+    assert_eq!(&received_payload[..], b"shared-job");
 
     disconnect(m1).await;
     disconnect(m2).await;
@@ -307,7 +309,7 @@ async fn shared_subscription_round_robin_delivery() -> anyhow::Result<()> {
             retain: false,
             topic: "rr/x".into(),
             packet_id: None,
-            payload: vec![i],
+            payload: bytes::Bytes::from(vec![i]),
         }))
         .await?;
     }
@@ -400,7 +402,7 @@ async fn shared_and_normal_subscription_both_deliver() -> anyhow::Result<()> {
         retain: false,
         topic: "data/x".into(),
         packet_id: None,
-        payload: b"mix-payload".to_vec(),
+        payload: bytes::Bytes::from_static(b"mix-payload"),
     }))
     .await?;
 
@@ -408,7 +410,7 @@ async fn shared_and_normal_subscription_both_deliver() -> anyhow::Result<()> {
     let normal_inbound = normal.recv().await?;
     match normal_inbound {
         Packet::Publish(Publish { payload, .. }) => {
-            assert_eq!(payload, b"mix-payload");
+            assert_eq!(&payload[..], b"mix-payload");
         }
         other => panic!("normal subscriber expected PUBLISH, got {other:?}"),
     }

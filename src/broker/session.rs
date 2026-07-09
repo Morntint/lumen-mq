@@ -1,5 +1,5 @@
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -107,6 +107,8 @@ pub struct SessionManager {
     epoch_counter: AtomicU64,
     max_offline_messages: usize,
     offline_message_ttl: Duration,
+    /// 在线会话计数（connected=true 的会话数）；用原子计数避免 O(N) 全扫描
+    online_count: AtomicUsize,
 }
 
 impl SessionManager {
@@ -120,6 +122,7 @@ impl SessionManager {
             epoch_counter: AtomicU64::new(0),
             max_offline_messages: max_offline,
             offline_message_ttl: ttl,
+            online_count: AtomicUsize::new(0),
         }
     }
 
@@ -143,7 +146,9 @@ impl SessionManager {
         peer_addr: SocketAddr,
         session_expiry: Option<u32>,
     ) -> (u64, bool, Vec<OutboundPublish>) {
-        let epoch = self.epoch_counter.fetch_add(1, Ordering::Relaxed) + 1;
+        // epoch 用于跨 shard 判断会话归属（owns），用 SeqCst 保证全局顺序一致性，
+        // 避免跨线程观察到 epoch 回退导致 owns() 误判
+        let epoch = self.epoch_counter.fetch_add(1, Ordering::SeqCst) + 1;
         let mut drained: Vec<OutboundPublish> = Vec::new();
         let mut session_present = false;
 
@@ -172,7 +177,12 @@ impl SessionManager {
 
         // 原子 drain + insert：entry API 在持锁期间完成 drain 旧离线消息并替换 entry，
         // 避免并发 register 同一 client_id 时两次 get() 都看到旧 entry 导致重复 drain
+        // 同时维护 online_count：新 entry 必为 connected=true
+        //   - Vacant：净增 1
+        //   - Occupied 且旧 entry 离线：净增 1（离线→在线）
+        //   - Occupied 且旧 entry 在线：净变化 0（在线被接管仍在线）
         use dashmap::mapref::entry::Entry;
+        let mut inc_online = false;
         match self.sessions.entry(client_id) {
             Entry::Occupied(mut occ) => {
                 let old = occ.get_mut();
@@ -182,11 +192,18 @@ impl SessionManager {
                         drained = q.drain();
                     }
                 }
+                if !old.connected {
+                    inc_online = true;
+                }
                 occ.insert(new_entry);
             }
             Entry::Vacant(vac) => {
+                inc_online = true;
                 vac.insert(new_entry);
             }
+        }
+        if inc_online {
+            self.online_count.fetch_add(1, Ordering::Relaxed);
         }
         (epoch, session_present, drained)
     }
@@ -203,18 +220,43 @@ impl SessionManager {
         self.sessions.get(client_id).map(|e| e.tx.clone())
     }
 
+    /// 查询某 client_id 是否为 clean_session=true 的会话
+    /// 供持久化逻辑判断是否应落盘（clean=true 不落盘）
+    pub fn is_clean_session(&self, client_id: &str) -> bool {
+        self.sessions
+            .get(client_id)
+            .map(|e| e.clean_session)
+            .unwrap_or(false)
+    }
+
+    /// 查询某 client_id 的会话是否在线（connected=true 且存在）
+    /// 供 admin delete_session 校验，避免误删在线会话
+    pub fn is_online(&self, client_id: &str) -> bool {
+        self.sessions
+            .get(client_id)
+            .map(|e| e.connected)
+            .unwrap_or(false)
+    }
+
     /// 投递一条出站消息：在线则发送，离线则入队（仅 clean_session=false 会话）
     /// 返回 true 表示已成功处理（在线发送成功或离线入队）
+    ///
+    /// 并发安全：在持 DashMap Ref（shard 读锁）期间不调用 mpsc::try_send / enqueue，
+    /// 先 clone 出 tx 与 offline_queue 后立即 drop ref，再执行实际投递，
+    /// 避免 panic 污染 shard 锁。
     pub fn deliver_or_enqueue(&self, client_id: &str, msg: OutboundPublish) -> DeliveryOutcome {
-        let Some(ref_entry) = self.sessions.get(client_id) else {
-            return DeliveryOutcome::NoSession;
+        // 取出所需句柄后立即释放 DashMap Ref（shard 读锁）
+        let (connected, tx, offline_queue) = match self.sessions.get(client_id) {
+            Some(e) => (e.connected, e.tx.clone(), e.offline_queue.clone()),
+            None => return DeliveryOutcome::NoSession,
         };
-        if ref_entry.connected {
-            match ref_entry.tx.try_send(msg) {
+        // ref 已 drop，此处不再持有 shard 读锁
+        if connected {
+            match tx.try_send(msg) {
                 Ok(()) => DeliveryOutcome::Sent,
                 Err(mpsc::error::TrySendError::Full(msg)) => {
                     // 通道已满；若有离线队列则入队，否则丢弃
-                    if let Some(q) = &ref_entry.offline_queue {
+                    if let Some(q) = &offline_queue {
                         q.enqueue(msg);
                         DeliveryOutcome::Enqueued
                     } else {
@@ -223,7 +265,7 @@ impl SessionManager {
                 }
                 Err(mpsc::error::TrySendError::Closed(msg)) => {
                     // 通道已关闭但会话仍存在；走离线入队
-                    if let Some(q) = &ref_entry.offline_queue {
+                    if let Some(q) = &offline_queue {
                         q.enqueue(msg);
                         DeliveryOutcome::Enqueued
                     } else {
@@ -231,7 +273,7 @@ impl SessionManager {
                     }
                 }
             }
-        } else if let Some(q) = &ref_entry.offline_queue {
+        } else if let Some(q) = &offline_queue {
             q.enqueue(msg);
             DeliveryOutcome::Enqueued
         } else {
@@ -241,23 +283,34 @@ impl SessionManager {
     }
 
     pub fn remove(&self, client_id: &str) -> Option<SessionEntry> {
-        self.sessions.remove(client_id).map(|(_, v)| v)
+        self.sessions.remove(client_id).map(|(_, v)| {
+            if v.connected {
+                self.online_count.fetch_sub(1, Ordering::Relaxed);
+            }
+            v
+        })
     }
 
     /// 仅当 epoch 匹配时移除会话（避免竞态误删重连后的新会话）
     pub fn remove_if_epoch(&self, client_id: &str, epoch: u64) -> Option<SessionEntry> {
         self.sessions
             .remove_if(client_id, |_, e| e.epoch == epoch)
-            .map(|(_, v)| v)
+            .map(|(_, v)| {
+                if v.connected {
+                    self.online_count.fetch_sub(1, Ordering::Relaxed);
+                }
+                v
+            })
     }
 
     /// 标记离线但保留（用于 clean_session=false 的会话恢复）
     /// 记录 offline_at 时间戳，供 session_expiry 过期判断使用
     pub fn mark_offline(&self, client_id: &str, epoch: u64) {
         if let Some(mut e) = self.sessions.get_mut(client_id) {
-            if e.epoch == epoch {
+            if e.epoch == epoch && e.connected {
                 e.connected = false;
                 e.offline_at = Some(Instant::now());
+                self.online_count.fetch_sub(1, Ordering::Relaxed);
             }
         }
     }
@@ -266,9 +319,10 @@ impl SessionManager {
     #[allow(dead_code)]
     pub fn mark_online(&self, client_id: &str, epoch: u64) {
         if let Some(mut e) = self.sessions.get_mut(client_id) {
-            if e.epoch == epoch {
+            if e.epoch == epoch && !e.connected {
                 e.connected = true;
                 e.offline_at = None;
+                self.online_count.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -347,7 +401,7 @@ impl SessionManager {
     }
 
     pub fn online_count(&self) -> usize {
-        self.sessions.iter().filter(|e| e.connected).count()
+        self.online_count.load(Ordering::Relaxed)
     }
 
     pub fn total_count(&self) -> usize {
@@ -410,7 +464,7 @@ mod tests {
     fn mk_msg(topic: &str) -> OutboundPublish {
         OutboundPublish {
             topic: topic.into(),
-            payload: vec![1],
+            payload: bytes::Bytes::from(vec![1]),
             qos: QoS::AtLeastOnce,
             retain: false,
         }

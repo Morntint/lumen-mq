@@ -95,7 +95,7 @@ mod tests {
     fn mk(topic: &str) -> OutboundPublish {
         OutboundPublish {
             topic: topic.into(),
-            payload: vec![1],
+            payload: bytes::Bytes::from(vec![1]),
             qos: QoS::AtLeastOnce,
             retain: false,
         }

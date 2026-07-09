@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use bytes::Bytes;
+
 use crate::broker::retain::SharedRetainStore;
 use crate::broker::session::{delivery_qos, DeliveryOutcome, SharedSessionManager};
 use crate::broker::subscription::SharedSubscriptionTree;
@@ -10,10 +12,14 @@ use crate::utils::BrokerResult;
 
 /// 投递给某个会话的"待发送发布请求"
 /// 连接循环负责分配 packet_id 并组装 PUBLISH 报文（QoS1/2 的 inflight 管理在连接循环侧维护）
+///
+/// payload 使用 `Bytes`：路由阶段对每个匹配订阅者做的是引用计数 clone（cheap Arc bump），
+/// 避免大 payload 多订阅者场景下的 O(n×m) 全量内存拷贝；仅在真正发往网络（build_publish）
+/// 或进入 inflight 重传表时才转回 `Vec<u8>`。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct OutboundPublish {
     pub topic: String,
-    pub payload: Vec<u8>,
+    pub payload: Bytes,
     pub qos: QoS,
     pub retain: bool,
 }
@@ -65,9 +71,13 @@ impl Router {
         exclude_client_id: Option<&str>,
         trace_id: &str,
     ) -> BrokerResult<()> {
+        // payload 仅在此处拷贝一次为引用计数的 Bytes；后续每个订阅者的 clone 都是 cheap Arc bump，
+        // 避免大 payload 多订阅者场景下 per-subscriber 全量拷贝。
+        let payload_bytes = Bytes::copy_from_slice(payload);
+
         // 1. Retain 处理（无论是否有订阅者）
         if retain {
-            self.retain.set(topic, payload.to_vec(), qos);
+            self.retain.set(topic, payload_bytes.clone(), qos);
             tracing::debug!(%trace_id, %topic, ?qos, "retained message stored");
         }
 
@@ -83,7 +93,7 @@ impl Router {
             if exclude_client_id == Some(client_id.as_str()) {
                 continue;
             }
-            self.deliver_one(&client_id, topic, payload, qos, sub_qos, trace_id);
+            self.deliver_one(&client_id, topic, &payload_bytes, qos, sub_qos, trace_id);
         }
 
         Ok(())
@@ -94,7 +104,7 @@ impl Router {
         &self,
         client_id: &str,
         topic: &str,
-        payload: &[u8],
+        payload: &Bytes,
         pub_qos: QoS,
         sub_qos: QoS,
         trace_id: &str,
@@ -102,7 +112,7 @@ impl Router {
         let dq = delivery_qos(pub_qos, sub_qos);
         let req = OutboundPublish {
             topic: topic.to_string(),
-            payload: payload.to_vec(),
+            payload: payload.clone(),
             qos: dq,
             // 投递给订阅者时 retain=0（仅 retained 投递给新订阅者时由订阅逻辑置 1）
             retain: false,
@@ -135,7 +145,14 @@ impl Router {
                 tracing::debug!(%trace_id, client = %client_id, "outbound dropped (clean session offline)");
             }
             DeliveryOutcome::NoSession => {
-                // 订阅树与 session 不一致（理论不应发生）；忽略
+                // 订阅树与 session 不一致：可能是会话已过期/被清理但订阅树残留，
+                // 或并发竞态。记录 warn 便于运维排查。
+                tracing::warn!(
+                    %trace_id,
+                    client = %client_id,
+                    %topic,
+                    "routing target has no session (subscription tree inconsistency)"
+                );
             }
         }
     }
@@ -158,6 +175,7 @@ impl Router {
             retain: req.retain,
             topic: req.topic,
             packet_id,
+            // Bytes 引用计数 clone，零拷贝；codec 编码时 deref 为 &[u8]
             payload: req.payload,
         })
     }

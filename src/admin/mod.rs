@@ -97,6 +97,9 @@ impl AdminServer {
 
 /// 构建 axum 路由（独立暴露，便于测试）
 pub fn build_router(broker: Arc<BrokerState>) -> axum::Router {
+    // 若配置了 admin.token，则对写操作（DELETE/POST）应用 Token 鉴权中间件。
+    // 读端点（/health、/metrics、/dashboard、/api/v1/ws）保持开放（运维观测常用）。
+    let admin_token = broker.config().admin.token.clone();
     axum::Router::new()
         .route("/dashboard", get(dashboard_page))
         .route("/api/v1/ws", get(ws_dashboard))
@@ -108,6 +111,65 @@ pub fn build_router(broker: Arc<BrokerState>) -> axum::Router {
         .route("/api/v1/reload/plugin", post(reload_plugin))
         .route("/api/v1/publish", post(manual_publish))
         .with_state(broker)
+        .layer(axum::middleware::from_fn_with_state(
+            admin_token,
+            admin_token_auth,
+        ))
+}
+
+/// Admin API Token 鉴权中间件
+///
+/// - 仅对写操作（DELETE /api/v1/* 与 POST /api/v1/*）生效；读端点放行
+/// - 未配置 token 时全部放行（启动时 validate.rs 已强制非环回必须配 token）
+/// - 客户端通过 `Authorization: Bearer <token>` 携带凭证
+async fn admin_token_auth(
+    State(token): State<String>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    // 未配置 token → 放行（启动期 validate 已保证非环回必须配 token）
+    if token.is_empty() {
+        return next.run(req).await;
+    }
+    let path = req.uri().path();
+    let method = req.method().clone();
+    // 仅保护 /api/v1/* 下的写操作
+    let is_protected = path.starts_with("/api/v1/")
+        && (method == axum::http::Method::POST || method == axum::http::Method::DELETE);
+    if !is_protected {
+        return next.run(req).await;
+    }
+    // 校验 Authorization: Bearer <token>
+    let auth_ok = req
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .map(|provided| constant_time_eq(provided.as_bytes(), token.as_bytes()))
+        .unwrap_or(false);
+    if !auth_ok {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ActionResponse {
+                ok: false,
+                message: "missing or invalid admin token".into(),
+            }),
+        )
+            .into_response();
+    }
+    next.run(req).await
+}
+
+/// 常数时间字符串比较，避免计时侧信道泄露 token
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 // —— 响应结构 ——
@@ -191,8 +253,9 @@ async fn metrics(State(broker): State<Arc<BrokerState>>) -> Response {
 
 async fn list_sessions(State(broker): State<Arc<BrokerState>>) -> Json<SessionsListResponse> {
     let snap = broker.sessions().iter_snapshot();
+    let total = snap.len();
     let online = snap.iter().filter(|(_, c, _, _)| *c).count();
-    let offline = snap.len().saturating_sub(online);
+    let offline = total - online;
     let sessions = snap
         .into_iter()
         .map(|(client_id, connected, peer_addr, _connected_at)| SessionInfo {
@@ -204,7 +267,7 @@ async fn list_sessions(State(broker): State<Arc<BrokerState>>) -> Json<SessionsL
         })
         .collect();
     Json(SessionsListResponse {
-        total: online + offline,
+        total,
         online,
         offline,
         sessions,
@@ -216,6 +279,22 @@ async fn delete_session(
     Path(client_id): Path<String>,
 ) -> Response {
     info!(client = %client_id, "admin: delete session requested");
+
+    // 校验会话是否在线：在线会话拒绝删除，避免误伤重连后的新会话。
+    // 运维应先断开客户端再调用此接口清理残留离线会话。
+    if broker.sessions().is_online(&client_id) {
+        return (
+            StatusCode::CONFLICT,
+            Json(ActionResponse {
+                ok: false,
+                message: format!(
+                    "session '{client_id}' is currently online; disconnect the client first"
+                ),
+            }),
+        )
+            .into_response();
+    }
+
     // 移除会话 + 订阅 + 离线队列 + 持久化快照
     broker.subscriptions().unsubscribe_all(&client_id);
     broker.sessions().remove(&client_id);
@@ -304,8 +383,35 @@ async fn manual_publish(
         retain: req.retain,
         topic: req.topic.clone(),
         packet_id: None,
-        payload: req.payload.into_bytes(),
+        payload: bytes::Bytes::from(req.payload.into_bytes()),
     };
+    // 走与正常 PUBLISH 相同的 security/plugin 检查，避免 admin 接口绕过限流/内容过滤
+    if let Err(e) = broker.security().check_publish(
+        "admin-api",
+        publish.payload.len(),
+        broker.config().broker.max_packet_size,
+    ) {
+        METRICS.inc_security_rejected();
+        return (
+            StatusCode::FORBIDDEN,
+            Json(ActionResponse {
+                ok: false,
+                message: format!("rejected by security guard: {e}"),
+            }),
+        )
+            .into_response();
+    }
+    if let Err(e) = broker.plugin().check_publish(&publish) {
+        METRICS.inc_plugin_rejected();
+        return (
+            StatusCode::FORBIDDEN,
+            Json(ActionResponse {
+                ok: false,
+                message: format!("rejected by plugin guard: {e}"),
+            }),
+        )
+            .into_response();
+    }
     let trace_id = crate::utils::time::trace_id();
     match broker.router().route_inbound_publish(&publish, Some("admin-api"), &trace_id) {
         Ok(()) => {
@@ -359,23 +465,37 @@ async fn ws_dashboard(
     ws.on_upgrade(|socket| handle_ws_dashboard(socket, broker))
 }
 
-/// WebSocket 连接处理循环：周期性推送仪表盘快照
+/// WebSocket 连接处理循环：周期性推送仪表盘快照，同时处理客户端帧（Close/Ping）
 async fn handle_ws_dashboard(mut socket: WebSocket, broker: Arc<BrokerState>) {
     let mut interval = tokio::time::interval(Duration::from_secs(2));
     interval.tick().await; // 首次立即推送
 
     loop {
-        interval.tick().await;
-        let snap = build_dashboard_snapshot(&broker);
-        let json = match serde_json::to_string(&snap) {
-            Ok(j) => j,
-            Err(e) => {
-                warn!(error = %e, "dashboard snapshot serialize failed");
-                continue;
+        tokio::select! {
+            // 周期推送仪表盘快照
+            _ = interval.tick() => {
+                let snap = build_dashboard_snapshot(&broker);
+                let json = match serde_json::to_string(&snap) {
+                    Ok(j) => j,
+                    Err(e) => {
+                        warn!(error = %e, "dashboard snapshot serialize failed");
+                        continue;
+                    }
+                };
+                if socket.send(Message::Text(json)).await.is_err() {
+                    break; // 客户端断开
+                }
             }
-        };
-        if socket.send(Message::Text(json)).await.is_err() {
-            break; // 客户端断开
+            // 同时接收客户端帧：处理 Close（及时退出）、Ping；忽略其他
+            msg = socket.recv() => {
+                match msg {
+                    Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                    Some(Ok(Message::Ping(p))) => {
+                        let _ = socket.send(Message::Pong(p)).await;
+                    }
+                    Some(Ok(_)) => {} // 忽略 Text/Binary/Pong
+                }
+            }
         }
     }
     let _ = socket.close().await;
@@ -425,11 +545,13 @@ mod tests {
     use tower::ServiceExt;
 
     fn make_broker() -> Arc<BrokerState> {
-        let mut settings = Settings::default();
-        settings.auth = AuthConfig {
-            mode: AuthMode::Anonymous,
-            allow_anonymous: true,
-            users: vec![],
+        let settings = Settings {
+            auth: AuthConfig {
+                mode: AuthMode::Anonymous,
+                allow_anonymous: true,
+                users: vec![],
+            },
+            ..Default::default()
         };
         let config = Arc::new(settings);
         let auth = Arc::new(Authenticator::new(Arc::new(config.auth.clone())));

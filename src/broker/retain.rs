@@ -11,6 +11,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use bytes::Bytes;
 use parking_lot::RwLock;
 
 use crate::broker::router::OutboundPublish;
@@ -22,7 +23,7 @@ use crate::storage::SharedStorage;
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RetainedMessage {
     pub topic: String,
-    pub payload: Vec<u8>,
+    pub payload: Bytes,
     pub qos: QoS,
 }
 
@@ -31,6 +32,8 @@ pub struct RetainedMessage {
 pub struct RetainStore {
     map: RwLock<HashMap<String, RetainedMessage>>,
     storage: Option<SharedStorage>,
+    /// retained payload 最大字节数；0 表示不限制（用 broker.max_packet_size 兜底）
+    max_payload_bytes: usize,
 }
 
 impl RetainStore {
@@ -43,7 +46,14 @@ impl RetainStore {
         Self {
             map: RwLock::new(HashMap::new()),
             storage: Some(storage),
+            max_payload_bytes: 0,
         }
+    }
+
+    /// 设置 retained payload 最大字节数（通常来自 broker.max_packet_size）
+    pub fn with_max_payload_bytes(mut self, max: usize) -> Self {
+        self.max_payload_bytes = max;
+        self
     }
 
     /// 从 sled 加载全部 retained 到内存（启动时调用）
@@ -60,20 +70,36 @@ impl RetainStore {
     /// - `payload` 为空 → 删除该 topic 的 retained
     /// - `payload` 非空 → 写入/覆盖
     /// - 主题含通配符则忽略（仅精确主题可被 retain）
-    pub fn set(&self, topic: &str, payload: Vec<u8>, qos: QoS) {
+    ///
+    /// 接受 `impl Into<Bytes>`：调用方可传 `Vec<u8>`（零拷贝转换为 Bytes）或现成的 `Bytes`，
+    /// 避免在路由热路径上重复分配。
+    pub fn set(&self, topic: &str, payload: impl Into<Bytes>, qos: QoS) {
         if topic.is_empty() || topic.contains('+') || topic.contains('#') {
+            return;
+        }
+        let payload = payload.into();
+        // payload 上限校验：防止 admin /publish 或其他绕过 broker.max_packet_size
+        // 的路径写入超大 retained 消息，导致内存单调增长
+        if self.max_payload_bytes > 0 && payload.len() > self.max_payload_bytes {
+            tracing::warn!(
+                %topic,
+                payload_len = payload.len(),
+                max = self.max_payload_bytes,
+                "retained payload exceeds limit, rejected"
+            );
             return;
         }
         crate::monitor::METRICS.inc_retained_stored();
         let mut map = self.map.write();
         if payload.is_empty() {
-            map.remove(topic);
-            // 落盘删除
+            // 先落盘删除（与 insert 分支对称：失败时不改内存，避免内存与磁盘不一致）
             if let Some(s) = &self.storage {
                 if let Err(e) = s.delete_retained(topic) {
-                    tracing::warn!(error = %e, %topic, "persist delete_retained failed");
+                    tracing::warn!(error = %e, %topic, "persist delete_retained failed, skipping memory delete");
+                    return;
                 }
             }
+            map.remove(topic);
         } else {
             let msg = RetainedMessage {
                 topic: topic.to_string(),
@@ -188,7 +214,7 @@ mod tests {
     fn build_outbound_qos_downgrade() {
         let msg = RetainedMessage {
             topic: "t".into(),
-            payload: b"p".to_vec(),
+            payload: Bytes::from_static(b"p"),
             qos: QoS::ExactlyOnce,
         };
         let out = RetainStore::build_outbound(&msg, QoS::AtLeastOnce);

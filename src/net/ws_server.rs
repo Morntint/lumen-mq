@@ -230,10 +230,20 @@ impl WsServer {
                             continue;
                         }
                     };
+
+                    // 预置安全检查：accept 后立即校验 IP 黑白名单，
+                    // 命中则直接关闭，避免 WS 握手消耗资源
+                    if let Err(e) = self.broker.security().check_connection(peer) {
+                        warn!(peer = %peer, error = %e, "WS accept rejected by security guard");
+                        drop(socket);
+                        continue;
+                    }
+
                     let current = self.broker.metrics().connections_current
                         .load(std::sync::atomic::Ordering::Relaxed);
-                    if current as usize >= self.max_connections {
-                        warn!(peer = %peer, current, max = self.max_connections, "max connections reached, refusing WS");
+                    let pending = self.broker.metrics().pending_connections();
+                    if (current + pending) as usize >= self.max_connections {
+                        warn!(peer = %peer, current, pending, max = self.max_connections, "max connections reached (incl. pending), refusing WS");
                         drop(socket);
                         continue;
                     }
@@ -244,26 +254,32 @@ impl WsServer {
                     let expected_path = self.path.clone();
 
                     tokio::spawn(async move {
-                        // WebSocket 握手（含子协议协商 + 路径校验）
-                        let handshake = tokio_tungstenite::accept_hdr_async(socket, |req: &Request, mut resp: Response| -> Result<Response, ErrorResponse> { // clippy::result_large_err: axum 回调签名约束，无法规避
-                            // 路径软校验：记录不匹配情况，但不拒绝（兼容浏览器/MQTT.js 任意路径）
-                            let req_path = req.uri().path();
-                            if req_path != expected_path.as_str() {
-                                debug!(req_path = %req_path, expected = %expected_path, "ws path mismatch, accepting anyway");
-                            }
-                            negotiate_subprotocol(req, &mut resp);
-                            Ok(resp)
-                        }).await;
+                        // WebSocket 握手（含子协议协商 + 路径校验，10s 超时避免慢速攻击）
+                        let handshake = tokio::time::timeout(
+                            std::time::Duration::from_secs(10),
+                            tokio_tungstenite::accept_hdr_async(socket, |req: &Request, mut resp: Response| -> Result<Response, ErrorResponse> { // clippy::result_large_err: axum 回调签名约束，无法规避
+                                // 路径软校验：记录不匹配情况，但不拒绝（兼容浏览器/MQTT.js 任意路径）
+                                let req_path = req.uri().path();
+                                if req_path != expected_path.as_str() {
+                                    debug!(req_path = %req_path, expected = %expected_path, "ws path mismatch, accepting anyway");
+                                }
+                                negotiate_subprotocol(req, &mut resp);
+                                Ok(resp)
+                            }),
+                        ).await;
 
                         match handshake {
-                            Ok(ws_stream) => {
+                            Ok(Ok(ws_stream)) => {
                                 let adapter = WsStream::new(ws_stream);
                                 let _ = broker
                                     .handle_connection(adapter, peer, shutdown_rx)
                                     .await;
                             }
-                            Err(e) => {
+                            Ok(Err(e)) => {
                                 warn!(error = %e, %peer, "WebSocket handshake failed");
+                            }
+                            Err(_) => {
+                                warn!(%peer, "WebSocket handshake timeout (10s), closing");
                             }
                         }
                     });

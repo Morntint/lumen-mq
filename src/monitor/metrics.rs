@@ -8,6 +8,8 @@ pub struct Metrics {
     pub connections_total: AtomicU64,
     /// 当前在线连接数（可增可减）
     pub connections_current: AtomicI64,
+    /// 当前半连接数（已 accept 尚未完成鉴权）；用于 max_connections 准入控制
+    pub connections_pending: AtomicI64,
     /// 累计掉线/断开次数
     pub disconnect_count: AtomicU64,
 
@@ -65,6 +67,18 @@ impl Metrics {
     }
     pub fn dec_connections(&self) {
         self.connections_current.fetch_sub(1, Ordering::Relaxed);
+    }
+    /// 半连接计数 +1（accept 后、鉴权前）
+    pub fn inc_pending(&self) {
+        self.connections_pending.fetch_add(1, Ordering::Relaxed);
+    }
+    /// 半连接计数 -1（鉴权完成或连接提前断开）
+    pub fn dec_pending(&self) {
+        self.connections_pending.fetch_sub(1, Ordering::Relaxed);
+    }
+    /// 当前半连接数（供 accept 循环准入判断）
+    pub fn pending_connections(&self) -> i64 {
+        self.connections_pending.load(Ordering::Relaxed)
     }
     pub fn inc_publish(&self) {
         self.publish_received.fetch_add(1, Ordering::Relaxed);
@@ -134,6 +148,7 @@ impl Metrics {
         MetricsSnapshot {
             connections_total: self.connections_total.load(Ordering::Relaxed),
             connections_current: self.connections_current.load(Ordering::Relaxed),
+            connections_pending: self.connections_pending.load(Ordering::Relaxed),
             disconnect_count: self.disconnect_count.load(Ordering::Relaxed),
             messages_received: self.messages_received.load(Ordering::Relaxed),
             messages_sent: self.messages_sent.load(Ordering::Relaxed),
@@ -165,7 +180,8 @@ impl Metrics {
         let mut out = String::with_capacity(4096);
         // 连接指标
         push_metric(&mut out, "lumenmq_connections_total", "Cumulative connections since start", s.connections_total, "counter");
-        push_metric(&mut out, "lumenmq_connections_current", "Current online connections", s.connections_current as u64, "gauge");
+        push_metric(&mut out, "lumenmq_connections_current", "Current online connections", s.connections_current.max(0) as u64, "gauge");
+        push_metric(&mut out, "lumenmq_connections_pending", "Half-open connections (accepted, not yet authenticated)", s.connections_pending.max(0) as u64, "gauge");
         push_metric(&mut out, "lumenmq_disconnect_total", "Cumulative disconnects", s.disconnect_count, "counter");
         // 消息指标
         push_metric(&mut out, "lumenmq_messages_received_total", "Cumulative inbound messages", s.messages_received, "counter");
@@ -178,11 +194,11 @@ impl Metrics {
         // 订阅指标
         push_metric(&mut out, "lumenmq_subscribe_total", "Cumulative SUBSCRIBE packets", s.subscribe_count, "counter");
         push_metric(&mut out, "lumenmq_unsubscribe_total", "Cumulative UNSUBSCRIBE packets", s.unsubscribe_count, "counter");
-        push_metric(&mut out, "lumenmq_subscriptions_current", "Current non-shared subscriptions", s.subscriptions_current as u64, "gauge");
-        push_metric(&mut out, "lumenmq_shared_subscriptions_current", "Current shared subscription members", s.shared_subscriptions_current as u64, "gauge");
+        push_metric(&mut out, "lumenmq_subscriptions_current", "Current non-shared subscriptions", s.subscriptions_current.max(0) as u64, "gauge");
+        push_metric(&mut out, "lumenmq_shared_subscriptions_current", "Current shared subscription members", s.shared_subscriptions_current.max(0) as u64, "gauge");
         // 会话指标
-        push_metric(&mut out, "lumenmq_sessions_total", "Current total sessions (online + offline retained)", s.sessions_total as u64, "gauge");
-        push_metric(&mut out, "lumenmq_sessions_offline", "Current offline retained sessions", s.sessions_offline as u64, "gauge");
+        push_metric(&mut out, "lumenmq_sessions_total", "Current total sessions (online + offline retained)", s.sessions_total.max(0) as u64, "gauge");
+        push_metric(&mut out, "lumenmq_sessions_offline", "Current offline retained sessions", s.sessions_offline.max(0) as u64, "gauge");
         push_metric(&mut out, "lumenmq_sessions_expired_total", "Sessions cleaned up due to session_expiry", s.sessions_expired, "counter");
         // 存储指标
         push_metric(&mut out, "lumenmq_storage_writes_total", "Offline message writes to storage", s.storage_writes, "counter");
@@ -206,6 +222,7 @@ fn push_metric(out: &mut String, name: &str, help: &str, value: u64, kind: &str)
 pub struct MetricsSnapshot {
     pub connections_total: u64,
     pub connections_current: i64,
+    pub connections_pending: i64,
     pub disconnect_count: u64,
     pub messages_received: u64,
     pub messages_sent: u64,
@@ -233,6 +250,7 @@ pub struct MetricsSnapshot {
 pub static METRICS: Metrics = Metrics {
     connections_total: AtomicU64::new(0),
     connections_current: AtomicI64::new(0),
+    connections_pending: AtomicI64::new(0),
     disconnect_count: AtomicU64::new(0),
     messages_received: AtomicU64::new(0),
     messages_sent: AtomicU64::new(0),

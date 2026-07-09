@@ -18,7 +18,6 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use parking_lot::Mutex;
 use tracing::{debug, info, warn};
 
 use crate::config::SecurityConfig;
@@ -51,7 +50,8 @@ pub struct SecurityGuard {
     /// 单 IP 连接计数器（运行期状态，跨策略保留）
     ip_counter: IpConnectionCounter,
     /// 每客户端 PUBLISH 速率限流器（运行期状态）
-    rate_limiter: Mutex<ClientRateLimiter>,
+    /// 自身已含细粒度内锁，无需外层再套 Mutex（避免双重加锁）
+    rate_limiter: ClientRateLimiter,
 }
 
 impl SecurityGuard {
@@ -61,7 +61,7 @@ impl SecurityGuard {
         Ok(Arc::new(Self {
             policy: ArcSwap::from(Arc::new(policy)),
             ip_counter: IpConnectionCounter::new(),
-            rate_limiter: Mutex::new(ClientRateLimiter::new(cfg.publish_rate_per_second)),
+            rate_limiter: ClientRateLimiter::new(cfg.publish_rate_per_second),
         }))
     }
 
@@ -70,7 +70,7 @@ impl SecurityGuard {
         Arc::new(Self {
             policy: ArcSwap::from(Arc::new(SecurityPolicy::default())),
             ip_counter: IpConnectionCounter::new(),
-            rate_limiter: Mutex::new(ClientRateLimiter::new(0)),
+            rate_limiter: ClientRateLimiter::new(0),
         })
     }
 
@@ -92,9 +92,7 @@ impl SecurityGuard {
         let policy = Self::build_policy(cfg)?;
         self.policy.store(Arc::new(policy));
         // 限流速率变更时重建令牌桶表
-        self.rate_limiter
-            .lock()
-            .reset(cfg.publish_rate_per_second);
+        self.rate_limiter.reset(cfg.publish_rate_per_second);
         info!(
             enabled = cfg.enabled,
             blacklist = cfg.ip_blacklist.len(),
@@ -173,7 +171,7 @@ impl SecurityGuard {
             self.ip_counter.dec(peer.ip());
         }
         if let Some(cid) = client_id {
-            self.rate_limiter.lock().remove(cid);
+            self.rate_limiter.remove(cid);
         }
     }
 
@@ -205,14 +203,13 @@ impl SecurityGuard {
         }
 
         // 2. 速率限流
-        if policy.publish_rate_per_second > 0 {
-            let limiter = self.rate_limiter.lock();
-            if !limiter.try_consume(client_id) {
-                debug!(client = %client_id, "PUBLISH rejected: rate limited");
-                return Err(BrokerError::RateLimited(format!(
-                    "client {client_id} publish rate exceeded"
-                )));
-            }
+        if policy.publish_rate_per_second > 0
+            && !self.rate_limiter.try_consume(client_id)
+        {
+            debug!(client = %client_id, "PUBLISH rejected: rate limited");
+            return Err(BrokerError::RateLimited(format!(
+                "client {client_id} publish rate exceeded"
+            )));
         }
         Ok(())
     }

@@ -216,6 +216,9 @@ pub struct MonitorConfig {
 pub struct AdminConfig {
     pub enabled: bool,
     pub bind: String,
+    /// 鉴权 Token（为空时仅允许环回地址访问；非空时要求请求头
+    /// `Authorization: Bearer <token>` 匹配）
+    pub token: String,
 }
 
 /// 安全中间件配置（阶段四：IP 黑白名单 + 连接/消息限流）
@@ -294,4 +297,11 @@ pub struct ForwardConfig {
     pub timeout_secs: u64,
     /// 转发队列最大长度（溢出时丢弃最旧消息，防 OOM）
     pub max_queue: usize,
+    /// 允许转发到私有/环回/链路本地地址（SSRF 防护豁免）
+    ///
+    /// 默认 false：拒绝 127.0.0.0/8、RFC1918、169.254.0.0/16、fc00::/7 等内网地址。
+    /// 工业场景下若转发目标确实是内网 webhook 服务，可显式置 true 放行。
+    /// 任何通过无鉴权 reload/plugin 接口修改 url 的操作仍受此开关约束。
+    #[serde(default)]
+    pub allow_private_network: bool,
 }

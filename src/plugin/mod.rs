@@ -236,7 +236,7 @@ mod tests {
             retain: false,
             topic: topic.to_string(),
             packet_id: None,
-            payload: payload.to_vec(),
+            payload: bytes::Bytes::from(payload.to_vec()),
         }
     }
 

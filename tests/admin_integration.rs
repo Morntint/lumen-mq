@@ -7,6 +7,8 @@
 //! - /api/v1/reload/security 热重载生效
 //! - DELETE /api/v1/sessions/:client_id 清理会话后订阅者不再收到消息
 
+#![allow(clippy::field_reassign_with_default)]
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -222,7 +224,7 @@ async fn admin_manual_publish_delivers_to_mqtt_subscriber() -> anyhow::Result<()
     match inbound {
         Some(Packet::Publish(Publish { topic, payload, .. })) => {
             assert_eq!(topic, "admin/topic");
-            assert_eq!(payload, b"hello-from-admin");
+            assert_eq!(&payload[..], b"hello-from-admin");
         }
         other => panic!("expected PUBLISH from admin, got {other:?}"),
     }

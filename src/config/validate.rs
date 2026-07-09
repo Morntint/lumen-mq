@@ -19,6 +19,13 @@ pub fn validate(s: &Settings) -> BrokerResult<()> {
     }
     if s.admin.enabled {
         validate_bind(&s.admin.bind, "admin")?;
+        // 安全策略：admin API 暴露写操作（清理会话/重载配置/发布消息），
+        // 若绑定非环回地址则必须配置 token，否则任何网络可达者都能操纵 broker。
+        if s.admin.token.is_empty() && !is_loopback_bind(&s.admin.bind) {
+            return Err(BrokerError::Config(
+                "admin.token must be set when admin.bind is not loopback (non-127.0.0.1/::1)".into(),
+            ));
+        }
     }
 
     // broker 参数
@@ -46,14 +53,20 @@ pub fn validate(s: &Settings) -> BrokerResult<()> {
 }
 
 fn validate_bind(bind: &str, name: &str) -> BrokerResult<()> {
-    let (_, port) = bind
-        .rsplit_once(':')
-        .ok_or_else(|| BrokerError::Config(format!("{name}.bind invalid: '{bind}'")))?;
-    let port: u16 = port
+    // 用 SocketAddr::from_str 解析，正确处理 IPv6 形如 "[::1]:1883"
+    let addr: std::net::SocketAddr = bind
         .parse()
-        .map_err(|_| BrokerError::Config(format!("{name}.bind port invalid: '{port}'")))?;
-    if port == 0 {
+        .map_err(|_| BrokerError::Config(format!("{name}.bind invalid: '{bind}'")))?;
+    if addr.port() == 0 {
         return Err(BrokerError::Config(format!("{name}.bind port must not be 0")));
     }
     Ok(())
+}
+
+/// 判断 bind 字符串是否绑定到环回地址（127.0.0.1 / ::1）
+fn is_loopback_bind(bind: &str) -> bool {
+    match bind.parse::<std::net::SocketAddr>() {
+        Ok(addr) => addr.ip().is_loopback(),
+        Err(_) => false,
+    }
 }

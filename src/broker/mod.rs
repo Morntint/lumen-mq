@@ -37,6 +37,35 @@ use crate::net::{ConnContext, HeartbeatTimer, ShutdownRx};
 use crate::storage::{SharedStorage, Storage, SessionSnapshot};
 use crate::utils::{BrokerError, BrokerResult};
 
+/// 半连接计数 RAII 守卫
+///
+/// 在 accept 后、鉴权前创建（inc_pending）；鉴权通过时调用 promote() 转为正式连接
+/// （dec_pending，后续由 inc_connections 计数）；若鉴权前断开则 drop 时自动 dec_pending。
+/// 这样 max_connections 准入控制能覆盖半连接，防止 SYN flood / 慢 CONNECT 绕过上限。
+struct PendingGuard {
+    promoted: bool,
+}
+impl PendingGuard {
+    fn new() -> Self {
+        METRICS.inc_pending();
+        Self { promoted: false }
+    }
+    /// 鉴权完成，半连接转为正式连接；dec_pending 避免与 inc_connections 双重计数
+    fn promote(&mut self) {
+        if !self.promoted {
+            self.promoted = true;
+            METRICS.dec_pending();
+        }
+    }
+}
+impl Drop for PendingGuard {
+    fn drop(&mut self) {
+        if !self.promoted {
+            METRICS.dec_pending();
+        }
+    }
+}
+
 /// 连接循环控制流
 enum Control {
     Continue,
@@ -83,13 +112,18 @@ impl BrokerState {
         // RetainStore：若开启存储则附着
         let retain: SharedRetainStore = match &storage {
             Some(s) => {
-                let r = Arc::new(RetainStore::with_storage(s.clone()));
+                let r = Arc::new(
+                    RetainStore::with_storage(s.clone())
+                        .with_max_payload_bytes(config.broker.max_packet_size),
+                );
                 if let Err(e) = r.load_from_storage(s) {
                     warn!(error = %e, "load retained from storage failed");
                 }
                 r
             }
-            None => Arc::new(RetainStore::new()),
+            None => Arc::new(
+                RetainStore::new().with_max_payload_bytes(config.broker.max_packet_size),
+            ),
         };
 
         // Router：若开启存储则附着
@@ -192,10 +226,19 @@ impl BrokerState {
         Ok(())
     }
 
-    /// 持久化某客户端的会话快照（订阅列表）
+    /// 持久化某客户端的会话快照（订阅列表）。
+    /// 仅对 clean_session=false 的持久会话有意义；clean=true 的会话不应落盘。
     fn persist_session_snapshot(&self, client_id: &str) {
         let Some(storage) = &self.storage else { return };
+        // 若该会话为 clean_session=true，则不落盘（避免无谓 IO + 启动时误恢复）
+        if self.sessions.is_clean_session(client_id) {
+            return;
+        }
         let subs = self.subscriptions.subscriptions_of(client_id);
+        // 无订阅时也跳过落盘（避免空快照堆积）
+        if subs.is_empty() {
+            return;
+        }
         let snap = SessionSnapshot {
             client_id: client_id.to_string(),
             subscriptions: subs,
@@ -301,10 +344,14 @@ impl BrokerState {
         // 通过准入检查，登记 IP 计数（断开时由 on_disconnect 扣减）
         self.security.on_connect(peer);
 
+        // 半连接守卫：inc_pending；鉴权通过后 promote() 转 inc_connections，
+        // 鉴权前断开则 drop 自动 dec_pending
+        let mut guard = PendingGuard::new();
+
         // 运行连接生命周期；无论以何种方式退出，都需通知安全中间件扣减 IP 计数
         let mut client_id_out: Option<String> = None;
         let result = self
-            .handle_connection_inner(socket, peer, &mut shutdown, &mut client_id_out)
+            .handle_connection_inner(socket, peer, &mut shutdown, &mut client_id_out, &mut guard)
             .await;
         self.security.on_disconnect(peer, client_id_out.as_deref());
         result
@@ -316,6 +363,7 @@ impl BrokerState {
         peer: SocketAddr,
         shutdown: &mut ShutdownRx,
         client_id_out: &mut Option<String>,
+        guard: &mut PendingGuard,
     ) -> BrokerResult<()>
     where
         S: AsyncRead + AsyncWrite + Unpin,
@@ -328,7 +376,7 @@ impl BrokerState {
         let mut ctx = ConnContext::new(peer);
 
         // 1. 读取 CONNECT（首包必须在合理时间内到达）
-        let connect = match tokio::time::timeout(Duration::from_secs(10), stream.next()).await {
+        let mut connect = match tokio::time::timeout(Duration::from_secs(10), stream.next()).await {
             Ok(Some(Ok(Packet::Connect(c)))) => c,
             Ok(Some(Ok(_))) => {
                 debug!(peer = %peer, "first packet is not CONNECT, closing");
@@ -352,6 +400,22 @@ impl BrokerState {
         if connect.protocol_level != MQTT_3_1_1_LEVEL && connect.protocol_level != MQTT_5_LEVEL {
             let _ = sink.send(Packet::connack_error(connack_code::BAD_PROTOCOL_VERSION)).await;
             return Ok(());
+        }
+
+        // 2.5 空 client_id 处理：MQTT 规范允许 client_id="" + clean_session=true，
+        // 由 broker 分配唯一 ID；clean=false 时拒绝（无 client_id 无法持久化会话）
+        if connect.client_id.is_empty() {
+            if connect.clean_session {
+                connect.client_id = format!("auto-{}", uuid::Uuid::new_v4().simple());
+                debug!(peer = %peer, assigned = %connect.client_id, "assigned auto client_id for empty-id clean session");
+            } else {
+                warn!(peer = %peer, "empty client_id with clean_session=false, rejecting");
+                let _ = sink
+                    .send(Packet::connack_error(connack_code::IDENTIFIER_REJECTED))
+                    .await;
+                METRICS.inc_disconnect();
+                return Ok(());
+            }
         }
 
         // 3. 鉴权
@@ -408,6 +472,8 @@ impl BrokerState {
         );
         let session_present = session_present && !clean;
 
+        // 鉴权通过：半连接转正式连接（dec_pending），随后 inc_connections 计入在线
+        guard.promote();
         METRICS.inc_connections();
         info!(
             client = %client_id,
@@ -455,16 +521,49 @@ impl BrokerState {
 
         // 8. 投递离线消息（clean_session=false 会话恢复时）
         // 这些消息需要走 outbound 路径（分配 packet_id + 进 inflight）
+        // 用 select! 包裹 sink.send，确保 TCP 慢速时仍能响应 shutdown / 心跳
         for msg in offline_messages {
-            if sink.send(self.build_outbound_packet(
+            let Some(pkt) = self.build_outbound_packet(
                 &msg,
                 &mut next_pid,
                 &mut outbound_inflight,
-            )).await.is_err() {
-                self.on_abnormal_disconnect(&client_id, epoch, clean);
-                METRICS.dec_connections();
-                METRICS.inc_disconnect();
-                return Ok(());
+            ) else {
+                // inflight 表已满：离线消息也无法投递，丢弃并告警
+                METRICS.inc_message_dropped();
+                warn!(client = %client_id, topic = %msg.topic, "offline message dropped: inflight table full");
+                continue;
+            };
+            tokio::select! {
+                biased;
+                // 关闭信号优先：离线回放期间也能响应关停
+                res = shutdown.changed() => {
+                    if res.is_ok() && *shutdown.borrow() {
+                        debug!(client = %client_id, "shutdown during offline replay, closing");
+                        let _ = sink.send(Packet::Disconnect).await;
+                        self.cleanup(&client_id, epoch, clean);
+                        METRICS.dec_connections();
+                        METRICS.inc_disconnect();
+                        return Ok(());
+                    }
+                }
+                // 心跳检测：离线回放期间也能检测 keep-alive 超时
+                _ = heartbeat.tick() => {
+                    if ctx.is_keep_alive_expired() {
+                        warn!(client = %client_id, "keep-alive timeout during offline replay, closing");
+                        self.on_abnormal_disconnect(&client_id, epoch, clean);
+                        METRICS.dec_connections();
+                        METRICS.inc_disconnect();
+                        return Ok(());
+                    }
+                }
+                result = sink.send(pkt) => {
+                    if result.is_err() {
+                        self.on_abnormal_disconnect(&client_id, epoch, clean);
+                        METRICS.dec_connections();
+                        METRICS.inc_disconnect();
+                        return Ok(());
+                    }
+                }
             }
         }
         // 离线消息已由内存队列取出并投递，清空磁盘上的同名离线记录
@@ -554,7 +653,12 @@ impl BrokerState {
                         // 发送端已 drop（理论上不会，会话持有 tx）；防御性退出
                         break;
                     };
-                    let pkt = self.build_outbound_packet(&req, &mut next_pid, &mut outbound_inflight);
+                    let Some(pkt) = self.build_outbound_packet(&req, &mut next_pid, &mut outbound_inflight) else {
+                        // inflight 表已满：丢弃消息并告警（不静默降级 QoS）
+                        METRICS.inc_message_dropped();
+                        warn!(client = %client_id, topic = %req.topic, "outbound message dropped: inflight table full");
+                        continue;
+                    };
                     if sink.send(pkt).await.is_err() {
                         self.on_abnormal_disconnect(&client_id, epoch, clean);
                         break;
@@ -569,21 +673,30 @@ impl BrokerState {
         Ok(())
     }
 
-    /// 构造一条出站 PUBLISH 报文，必要时分配 packet_id 并登记 inflight
+    /// 构造一条出站 PUBLISH 报文，必要时分配 packet_id 并登记 inflight。
+    ///
+    /// 返回 `None` 表示因 inflight 表达到硬上限（broker.max_inflight）而丢弃，
+    /// 调用方应递增 messages_dropped 指标并记录告警，而不是静默降级为 QoS0
+    /// （降级会违反订阅 QoS 契约且难以排查）。
     fn build_outbound_packet(
         &self,
         req: &OutboundPublish,
         next_pid: &mut u16,
         inflight: &mut OutboundInflightTable,
-    ) -> Packet {
+    ) -> Option<Packet> {
         if req.qos == QoS::AtMostOnce {
             // QoS0：无需 inflight
-            return Router::build_publish(req.clone(), None);
+            return Some(Router::build_publish(req.clone(), None));
+        }
+        // 硬上限：超出 broker.max_inflight 时拒绝分配，避免单连接堆积数百 MB inflight
+        let max_inflight = self.config.broker.max_inflight;
+        if inflight.len() >= max_inflight {
+            return None;
         }
         let pid = allocate_pid(next_pid, inflight);
         if pid == 0 {
-            // inflight 表已满，降级为 QoS0（丢弃 packet_id，不跟踪 inflight）
-            return Router::build_publish(req.clone(), None);
+            // packet_id 空间耗尽（极端：65534 条 inflight）；同样拒绝
+            return None;
         }
         let entry = OutboundInflight::new(
             req.topic.clone(),
@@ -592,7 +705,7 @@ impl BrokerState {
             req.retain,
         );
         inflight.insert(pid, entry);
-        Router::build_publish(req.clone(), Some(pid))
+        Some(Router::build_publish(req.clone(), Some(pid)))
     }
 
     /// 处理一条入站报文
@@ -718,14 +831,10 @@ impl BrokerState {
             }
         };
 
-        // 生成轻量 TraceID，贯穿路由→投递链路（便于 grep 定位单条消息流向）
-        let trace_id = crate::utils::time::trace_id();
-        debug!(%trace_id, client = %client_id, topic = %p.topic, ?p.qos, payload_len = p.payload.len(), "PUBLISH received");
-
-        // QoS2 入站去重：若已存在同 packet_id 的 inflight，则不重复路由
-        let should_route = if security_rejected || plugin_rejected {
-            false
-        } else if p.qos == QoS::ExactlyOnce {
+        // QoS2 入站去重：即使被安全/插件拒绝，也要先登记 packet_id 到去重表，
+        // 否则客户端重发同 packet_id（PUBREC 丢失场景）后若限流恢复会被再次路由，
+        // 破坏 exactly-once 语义。
+        let should_route = if p.qos == QoS::ExactlyOnce {
             if let Some(id) = p.packet_id {
                 !inbound_qos2.on_publish(id)
             } else {
@@ -738,6 +847,9 @@ impl BrokerState {
             true
         };
 
+        // 被安全/插件拒绝时不路由，但 QoS2 已登记去重（避免重发绕过限流）
+        let should_route = should_route && !security_rejected && !plugin_rejected;
+
         if should_route {
             // 仅在消息未被拒绝时计数，避免被拒绝的消息也统计在 publish_received 中
             METRICS.inc_publish();
@@ -746,6 +858,9 @@ impl BrokerState {
                 QoS::AtLeastOnce => 1,
                 QoS::ExactlyOnce => 2,
             });
+            // 懒生成 TraceID：仅在实际路由时生成，被拒绝的消息不需要追踪路由链路
+            let trace_id = crate::utils::time::trace_id();
+            debug!(%trace_id, client = %client_id, topic = %p.topic, ?p.qos, payload_len = p.payload.len(), "PUBLISH received");
             self.router.route_inbound_publish(&p, Some(client_id), &trace_id)?;
             // 消息插件：HTTP 转发 hook（非阻塞，仅 try_send 到后台队列）
             // 仅在通过所有检查并已路由后才转发，避免转发被拒绝的消息
@@ -818,7 +933,12 @@ impl BrokerState {
             let retained = self.retain.matches(&filter);
             for msg in retained {
                 let out = RetainStore::build_outbound(&msg, sub_qos);
-                let pkt = self.build_outbound_packet(&out, next_pid, outbound_inflight);
+                let Some(pkt) = self.build_outbound_packet(&out, next_pid, outbound_inflight) else {
+                    // inflight 表已满：跳过该 retained 消息（不中断订阅流程）
+                    METRICS.inc_message_dropped();
+                    warn!(client = %client_id, topic = %out.topic, "retained message dropped: inflight table full");
+                    continue;
+                };
                 if sink.send(pkt).await.is_err() {
                     // sink 故障：交由外层主循环处理；这里直接返回错误
                     return Err(BrokerError::ConnectionClosed("sink closed during retained delivery".into()));
@@ -852,25 +972,32 @@ impl BrokerState {
 
     /// 会话清理（处理接管：仅当仍持有会话时清理）
     /// MQTT 5.0：clean=false 且 session_expiry=0 时，会话立即过期（等同 clean=true）
+    ///
+    /// 并发安全：通过 `remove_if_epoch` 原子声明清理权限——若新连接已 register
+    /// （新 epoch），则 remove_if_epoch 返回 None，本函数直接返回，不动新会话的订阅。
     fn cleanup(&self, client_id: &str, epoch: u64, clean: bool) {
-        if !self.sessions.owns(client_id, epoch) {
-            // 已被新连接接管，不动新会话
-            return;
-        }
         if clean {
+            // clean 会话：先用 remove_if_epoch 原子移除 entry（声明清理权限）。
+            // 若新连接已 register（不同 epoch），返回 None，不进行后续清理。
+            let Some(_entry) = self.sessions.remove_if_epoch(client_id, epoch) else {
+                return;
+            };
             self.subscriptions.unsubscribe_all(client_id);
-            // 使用 remove_if_epoch 原子移除，避免 owns→remove 之间的竞态误删重连会话
-            self.sessions.remove_if_epoch(client_id, epoch);
-            // clean 会话：删除磁盘上的会话快照与残留离线消息
             self.delete_session_snapshot(client_id);
         } else {
-            // 先 mark_offline 记录离线时间戳，用于后续 session_expiry 判断
+            // 先 mark_offline（仅当 epoch 匹配）记录离线时间戳
             self.sessions.mark_offline(client_id, epoch);
+            // 重新校验是否仍持有（mark_offline 与本调用之间可能被新连接接管）
+            if !self.sessions.owns(client_id, epoch) {
+                return;
+            }
             // MQTT 5.0：session_expiry=0 表示立即过期，应清理而非保留
             if self.sessions.is_session_expired(client_id) {
                 debug!(client = %client_id, "session expired (expiry=0), cleaning up");
+                let Some(_entry) = self.sessions.remove_if_epoch(client_id, epoch) else {
+                    return;
+                };
                 self.subscriptions.unsubscribe_all(client_id);
-                self.sessions.remove_if_epoch(client_id, epoch);
                 self.delete_session_snapshot(client_id);
                 return;
             }
@@ -880,23 +1007,38 @@ impl BrokerState {
     }
 
     /// 后台周期性扫描并清理已过期的离线会话（session_expiry 到期）
-    /// 由 main.rs 启动时 spawn；每 `interval` 扫描一次
-    pub fn spawn_session_expiry_sweeper(self: &Arc<Self>, interval: Duration) -> tokio::task::JoinHandle<()> {
+    /// 由 main.rs 启动时 spawn；每 `interval` 扫描一次。
+    /// 接受 shutdown_rx，收到关闭信号时退出循环（支持优雅关停）。
+    pub fn spawn_session_expiry_sweeper(
+        self: &Arc<Self>,
+        interval: Duration,
+        mut shutdown: ShutdownRx,
+    ) -> tokio::task::JoinHandle<()> {
         let broker = self.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
-                ticker.tick().await;
-                let expired = broker.sessions.cleanup_expired();
-                for client_id in &expired {
-                    broker.subscriptions.unsubscribe_all(client_id);
-                    broker.delete_session_snapshot(client_id);
-                    METRICS.inc_sessions_expired();
-                    debug!(client = %client_id, "session expired and cleaned up by sweeper");
-                }
-                if !expired.is_empty() {
-                    info!(count = expired.len(), "sweeper removed expired sessions");
+                tokio::select! {
+                    biased;
+                    res = shutdown.changed() => {
+                        if res.is_ok() && *shutdown.borrow() {
+                            info!("session expiry sweeper shutting down");
+                            break;
+                        }
+                    }
+                    _ = ticker.tick() => {
+                        let expired = broker.sessions.cleanup_expired();
+                        for client_id in &expired {
+                            broker.subscriptions.unsubscribe_all(client_id);
+                            broker.delete_session_snapshot(client_id);
+                            METRICS.inc_sessions_expired();
+                            debug!(client = %client_id, "session expired and cleaned up by sweeper");
+                        }
+                        if !expired.is_empty() {
+                            info!(count = expired.len(), "sweeper removed expired sessions");
+                        }
+                    }
                 }
             }
         })

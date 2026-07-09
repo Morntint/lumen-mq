@@ -5,6 +5,8 @@
 //! - WS 上的订阅/发布端到端流转
 //! - `mqtt` 子协议协商
 
+#![allow(clippy::field_reassign_with_default)]
+
 use std::sync::Arc;
 
 use bytes::BytesMut;
@@ -175,7 +177,7 @@ async fn websocket_mqtt_connect_and_subpub() -> anyhow::Result<()> {
         retain: false,
         topic: "a/b".into(),
         packet_id: Some(50),
-        payload: b"hello-ws".to_vec(),
+        payload: bytes::Bytes::from_static(b"hello-ws"),
     }))
     .await?;
     // 发布者应收到 PUBACK
@@ -187,7 +189,7 @@ async fn websocket_mqtt_connect_and_subpub() -> anyhow::Result<()> {
     match inbound {
         Packet::Publish(Publish { topic, payload, qos, .. }) => {
             assert_eq!(topic, "a/b");
-            assert_eq!(payload, b"hello-ws");
+            assert_eq!(&payload[..], b"hello-ws");
             assert_eq!(qos, QoS::AtLeastOnce);
         }
         other => panic!("expected PUBLISH, got {other:?}"),
@@ -233,7 +235,7 @@ async fn websocket_qos1_publish_ack() -> anyhow::Result<()> {
         retain: false,
         topic: "qos1/test".into(),
         packet_id: Some(777),
-        payload: b"qos1-payload".to_vec(),
+        payload: bytes::Bytes::from_static(b"qos1-payload"),
     }))
     .await?;
     let ack = c.recv_packet().await?;

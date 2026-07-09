@@ -7,6 +7,8 @@
 //! - HTTP 转发 hook 将匹配消息 POST 到外部端点
 //! - 热更新：运行期修改规则即时生效
 
+#![allow(clippy::field_reassign_with_default)]
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
@@ -121,7 +123,7 @@ fn publish_qos0(topic: &str, payload: &[u8]) -> Packet {
         retain: false,
         topic: topic.into(),
         packet_id: None,
-        payload: payload.to_vec(),
+        payload: bytes::Bytes::from(payload.to_vec()),
     })
 }
 
@@ -282,7 +284,7 @@ async fn payload_blacklist_blocks_publish() -> anyhow::Result<()> {
     match got {
         Ok(Ok(Packet::Publish(p))) => {
             assert_eq!(p.topic, "test/b");
-            assert_eq!(p.payload, b"clean data");
+            assert_eq!(&p.payload[..], b"clean data");
         }
         _ => anyhow::bail!("expected clean message"),
     }
@@ -368,6 +370,7 @@ async fn http_forwarder_posts_matching_messages() -> anyhow::Result<()> {
         topic_filter: "sensor/#".into(),
         timeout_secs: 2,
         max_queue: 64,
+        allow_private_network: true,
     };
     let broker = make_broker_with_plugin(plugin);
     let (addr, tx) = spawn_tcp_server(broker).await;
@@ -403,6 +406,7 @@ async fn invalid_plugin_config_falls_back_to_disabled() -> anyhow::Result<()> {
         topic_filter: "".into(),
         timeout_secs: 1,
         max_queue: 16,
+        allow_private_network: false,
     };
     let broker = make_broker_with_plugin(plugin);
     let (addr, tx) = spawn_tcp_server(broker).await;

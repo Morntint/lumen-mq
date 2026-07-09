@@ -9,6 +9,8 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
+
 use crate::codec::{Packet, Publish, QoS};
 
 /// 出站 inflight 项的握手阶段
@@ -24,7 +26,7 @@ pub enum AckStage {
 #[derive(Debug, Clone)]
 pub struct OutboundInflight {
     pub topic: String,
-    pub payload: Vec<u8>,
+    pub payload: Bytes,
     pub qos: QoS,
     pub retain: bool,
     pub stage: AckStage,
@@ -33,7 +35,7 @@ pub struct OutboundInflight {
 }
 
 impl OutboundInflight {
-    pub fn new(topic: String, payload: Vec<u8>, qos: QoS, retain: bool) -> Self {
+    pub fn new(topic: String, payload: Bytes, qos: QoS, retain: bool) -> Self {
         Self {
             topic,
             payload,
@@ -202,7 +204,7 @@ mod tests {
         let mut table = OutboundInflightTable::new();
         let entry = OutboundInflight::new(
             "a/b".into(),
-            vec![1, 2, 3],
+            Bytes::from(vec![1, 2, 3]),
             QoS::ExactlyOnce,
             false,
         );
@@ -223,7 +225,7 @@ mod tests {
     #[test]
     fn retry_expired_resends_and_fails() {
         let mut table = OutboundInflightTable::new();
-        let mut entry = OutboundInflight::new("t".into(), vec![], QoS::AtLeastOnce, false);
+        let mut entry = OutboundInflight::new("t".into(), Bytes::new(), QoS::AtLeastOnce, false);
         // 让 last_sent_at 处于过去，确保超时
         entry.last_sent_at = Instant::now() - Duration::from_secs(10);
         table.insert(1, entry);

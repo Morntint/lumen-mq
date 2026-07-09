@@ -1,4 +1,4 @@
-use bytes::{BufMut, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use tokio_util::codec::{Decoder, Encoder};
 
 use crate::utils::CodecError;
@@ -96,6 +96,11 @@ fn decode_remaining_length(src: &[u8]) -> Result<Option<(usize, usize)>, CodecEr
         if idx >= src.len() {
             return Ok(None); // 需要更多字节
         }
+        // 累加前先校验 multiplier 上限（MQTT 规范最多 4 字节，multiplier 最大 128^3）
+        // 避免恶意构造的 5+ 字节 continuation 导致溢出
+        if multiplier > 128 * 128 * 128 {
+            return Err(CodecError::InvalidRemainingLength(value));
+        }
         let byte = src[idx];
         value += ((byte & 0x7F) as usize) * multiplier;
         idx += 1;
@@ -103,9 +108,6 @@ fn decode_remaining_length(src: &[u8]) -> Result<Option<(usize, usize)>, CodecEr
             return Ok(Some((value, idx)));
         }
         multiplier *= 128;
-        if multiplier > 128 * 128 * 128 {
-            return Err(CodecError::InvalidRemainingLength(value));
-        }
     }
 }
 
@@ -442,13 +444,19 @@ fn decode_publish(r: &mut Reader, flags: u8) -> Result<Packet, CodecError> {
     let dup = (flags & 0b1000) != 0;
     let qos = QoS::from_u8((flags & 0b0110) >> 1)?;
     let retain = (flags & 0b0001) != 0;
+    // MQTT 3.1.1 [MQTT-3.3.1-2]：QoS0 报文的 DUP 必须为 0
+    if qos == QoS::AtMostOnce && dup {
+        return Err(CodecError::MalformedBody(
+            "DUP=1 is invalid for QoS0 PUBLISH".into(),
+        ));
+    }
     let topic = r.read_string()?;
     let packet_id = if qos != QoS::AtMostOnce {
         Some(validate_packet_id(r.read_u16()?)?)
     } else {
         None
     };
-    let payload = r.read_bytes(r.remaining())?.to_vec();
+    let payload = Bytes::copy_from_slice(r.read_bytes(r.remaining())?);
     Ok(Packet::Publish(Publish {
         dup,
         qos,
@@ -465,7 +473,10 @@ fn decode_subscribe(r: &mut Reader) -> Result<Packet, CodecError> {
     while r.remaining() > 0 {
         let topic_filter = r.read_string()?;
         let qos_byte = r.read_u8()?;
-        let qos = QoS::from_u8(qos_byte)?;
+        // MQTT 5.0：订阅选项字节低 2 位为 QoS，高 6 位为
+        // No Local / Retain As Published / Retain Handling 等选项。
+        // 本轻量实现仅解析 QoS（3.1.1 兼容：高 6 位为保留位，应为 0）。
+        let qos = QoS::from_u8(qos_byte & 0b0000_0011)?;
         topics.push(SubscribeTopic { topic_filter, qos });
     }
     if topics.is_empty() {

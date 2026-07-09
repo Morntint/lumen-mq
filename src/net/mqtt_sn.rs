@@ -15,7 +15,6 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -379,6 +378,13 @@ struct SnClient {
     id_to_topic: HashMap<u16, String>,
     /// 出站 QoS1 msg_id 分配
     next_msg_id: u16,
+    /// 本客户端下一个可分配的主题 ID（按 client 独立，避免跨客户端共享全局计数器
+    /// 导致 wraparound 时覆盖其他客户端的 topic 映射）
+    next_topic_id: u16,
+    /// 是否处于睡眠态（DISCONNECT with duration）
+    sleeping: bool,
+    /// 睡眠到期时间（sleeping=true 时有效）；超时后由 sweeper 清理会话
+    sleep_until: Option<Instant>,
 }
 
 impl SnClient {
@@ -393,6 +399,9 @@ impl SnClient {
             topic_to_id: HashMap::new(),
             id_to_topic: HashMap::new(),
             next_msg_id: 1,
+            next_topic_id: TOPIC_ID_MIN,
+            sleeping: false,
+            sleep_until: None,
         }
     }
 
@@ -401,21 +410,35 @@ impl SnClient {
     }
 
     /// 分配主题 ID（若已存在则返回既有）
-    fn assign_topic_id(&mut self, topic: &str, next_topic_id: &AtomicU16) -> u16 {
+    ///
+    /// 按客户端独立分配：从 `next_topic_id` 自增，若该 ID 已被本客户端占用
+    /// 则继续尝试下一个，wraparound 到 TOPIC_ID_MIN。
+    /// 避免跨客户端共享全局 AtomicU16 导致 wraparound 后覆盖其他客户端映射。
+    fn assign_topic_id(&mut self, topic: &str) -> u16 {
         if let Some(&id) = self.topic_to_id.get(topic) {
             return id;
         }
-        let id = loop {
-            let v = next_topic_id.fetch_add(1, Ordering::Relaxed);
-            let v = if v > TOPIC_ID_MAX { TOPIC_ID_MIN } else { v };
+        // 最多尝试 65534 次（排除 0x0000 和 0xFFFF），避免死循环
+        for _ in 0..=0xFFFE {
+            let v = self.next_topic_id;
+            self.next_topic_id = if self.next_topic_id >= TOPIC_ID_MAX {
+                TOPIC_ID_MIN
+            } else {
+                self.next_topic_id + 1
+            };
             if v == 0 {
                 continue;
             }
-            break v;
-        };
-        self.topic_to_id.insert(topic.to_string(), id);
-        self.id_to_topic.insert(id, topic.to_string());
-        id
+            // 跳过已被占用的 ID（避免覆盖既有映射）
+            if self.id_to_topic.contains_key(&v) {
+                continue;
+            }
+            self.topic_to_id.insert(topic.to_string(), v);
+            self.id_to_topic.insert(v, topic.to_string());
+            return v;
+        }
+        // 理论上不会到达（65534 个 ID 全占满需要客户端订阅 65534 个主题）
+        TOPIC_ID_MIN
     }
 
     /// 按 ID 查找主题名
@@ -443,8 +466,6 @@ pub struct MqttSnServer {
     #[allow(dead_code)]
     max_connections: usize,
     shutdown: ShutdownRx,
-    /// 全局主题 ID 分配计数器（跨客户端不冲突也可，简单起见用全局）
-    next_topic_id: Arc<AtomicU16>,
 }
 
 impl MqttSnServer {
@@ -459,7 +480,6 @@ impl MqttSnServer {
             broker,
             max_connections,
             shutdown,
-            next_topic_id: Arc::new(AtomicU16::new(TOPIC_ID_MIN)),
         }
     }
 
@@ -469,7 +489,6 @@ impl MqttSnServer {
         info!(addr = %self.bind, "MQTT-SN UDP listener started");
 
         let clients: Arc<DashMap<SocketAddr, SnClient>> = Arc::new(DashMap::new());
-        let next_topic_id = self.next_topic_id.clone();
         let broker = self.broker.clone();
 
         // 心跳超时清理任务
@@ -485,9 +504,20 @@ impl MqttSnServer {
                     _ = cleanup_shutdown.changed() => break,
                     _ = tick.tick() => {
                         let now = Instant::now();
+                        // 收集两类过期：keep-alive 超时 + 睡眠超时
                         let expired: Vec<(SocketAddr, String, u64, bool)> = cleanup_clients
                             .iter()
                             .filter_map(|e| {
+                                // 睡眠态：检查 sleep_until 是否到期
+                                if e.sleeping {
+                                    if let Some(until) = e.sleep_until {
+                                        if now >= until {
+                                            return Some((e.peer, e.client_id.clone(), e.epoch, e.clean));
+                                        }
+                                    }
+                                    return None;
+                                }
+                                // 活跃态：检查 keep-alive 超时
                                 if e.keep_alive_secs == 0 {
                                     return None;
                                 }
@@ -502,7 +532,7 @@ impl MqttSnServer {
                             })
                             .collect();
                         for (peer, client_id, epoch, clean) in expired {
-                            warn!(%peer, client = %client_id, "MQTT-SN keep-alive expired");
+                            warn!(%peer, client = %client_id, "MQTT-SN session expired (keep-alive or sleep timeout)");
                             cleanup_clients.remove(&peer);
                             // 清理会话（clean=true 删除；clean=false 仅标记离线）
                             cleanup_session(&cleanup_broker, &client_id, epoch, clean);
@@ -540,7 +570,7 @@ impl MqttSnServer {
                         }
                     };
                     Self::handle(
-                        pkt, peer, &socket, &broker, &clients, &next_topic_id,
+                        pkt, peer, &socket, &broker, &clients,
                     ).await;
                 }
             }
@@ -560,20 +590,18 @@ impl MqttSnServer {
         socket: &Arc<UdpSocket>,
         broker: &Arc<BrokerState>,
         clients: &Arc<DashMap<SocketAddr, SnClient>>,
-        next_topic_id: &Arc<AtomicU16>,
     ) {
         match pkt {
             SnPacket::Connect { flags, protocol_id, duration, client_id } => {
                 Self::handle_connect(
                     broker, clients, socket, peer, flags, protocol_id, duration, client_id,
-                    next_topic_id.clone(),
                 ).await;
             }
             SnPacket::Register { flags: _, topic_id: _, msg_id, topic_name } => {
                 // 客户端请求分配主题 ID
                 let resp = if let Some(mut c) = clients.get_mut(&peer) {
                     c.touch();
-                    let tid = c.assign_topic_id(&topic_name, next_topic_id);
+                    let tid = c.assign_topic_id(&topic_name);
                     SnPacket::Regack {
                         flags: 0,
                         topic_id: tid,
@@ -597,7 +625,7 @@ impl MqttSnServer {
             }
             SnPacket::Subscribe { flags, msg_id, topic } => {
                 Self::handle_subscribe(
-                    broker, clients, socket, peer, flags, msg_id, topic, next_topic_id,
+                    broker, clients, socket, peer, flags, msg_id, topic,
                 ).await;
             }
             SnPacket::Unsubscribe { flags: _, msg_id, topic } => {
@@ -626,12 +654,16 @@ impl MqttSnServer {
             SnPacket::Disconnect { duration } => {
                 match duration {
                     Some(d) => {
-                        // 睡眠态：标记会话离线（消息入离线队列），保留会话订阅以便唤醒后恢复
+                        // 睡眠态：标记会话离线（消息入离线队列），保留会话订阅以便唤醒后恢复。
+                        // 不从 clients map 移除，改为设置 sleeping + sleep_until，
+                        // 由 sweeper 在睡眠超时后清理会话（避免会话永不过期）。
                         debug!(%peer, sleep_secs = d, "MQTT-SN client entering sleep state");
-                        if let Some((_, c)) = clients.remove(&peer) {
+                        if let Some(mut c) = clients.get_mut(&peer) {
                             if broker.sessions().owns(&c.client_id, c.epoch) {
                                 broker.sessions().mark_offline(&c.client_id, c.epoch);
                             }
+                            c.sleeping = true;
+                            c.sleep_until = Some(Instant::now() + Duration::from_secs(d as u64));
                             METRICS.dec_connections();
                         }
                     }
@@ -672,7 +704,6 @@ impl MqttSnServer {
         protocol_id: u8,
         duration: u16,
         client_id: String,
-        next_topic_id: Arc<AtomicU16>,
     ) {
         // 协议版本校验
         if protocol_id != PROTOCOL_ID_MQTTSN {
@@ -701,6 +732,10 @@ impl MqttSnServer {
         let clean = (flags & FLAG_CLEAN) != 0;
         let _will = (flags & FLAG_WILL) != 0; // 本实现忽略遗嘱
 
+        // 强制最小 keep-alive：MQTT-SN 规范允许 duration=0 表示"无超时"，
+        // 但恶意客户端可借此打满连接上限；本实现强制 0 → 60s 兜底。
+        let keep_alive_secs = if duration == 0 { 60 } else { duration };
+
         // 注册会话：复用 broker.sessions，用一个 tx 通道 + forwarder 任务
         let cap = broker.config().broker.max_inflight.max(16);
         let (tx, rx) = mpsc::channel::<OutboundPublish>(cap);
@@ -716,9 +751,9 @@ impl MqttSnServer {
         );
 
         METRICS.inc_connections();
-        info!(%peer, client = %client_id, clean, keep_alive = duration, "MQTT-SN client connected");
+        info!(%peer, client = %client_id, clean, keep_alive = keep_alive_secs, "MQTT-SN client connected");
 
-        let client = SnClient::new(client_id.clone(), epoch, clean, duration, peer);
+        let client = SnClient::new(client_id.clone(), epoch, clean, keep_alive_secs, peer);
         clients.insert(peer, client);
 
         // CONNACK
@@ -727,8 +762,12 @@ impl MqttSnServer {
         // 启动 forwarder：drain rx → 封装 SN PUBLISH → UDP 回送
         let socket_cloned = socket.clone();
         let clients_cloned = clients.clone();
+        let broker_cloned = broker.clone();
         tokio::spawn(async move {
-            forward_outbound(rx, socket_cloned, peer, client_id.clone(), clients_cloned, next_topic_id).await;
+            forward_outbound(
+                rx, socket_cloned, peer, client_id.clone(), epoch,
+                broker_cloned, clients_cloned,
+            ).await;
         });
     }
 
@@ -824,7 +863,6 @@ impl MqttSnServer {
         flags: u8,
         msg_id: u16,
         topic: Vec<u8>,
-        next_topic_id: &AtomicU16,
     ) {
         let qos = match flags_to_qos(flags) {
             Ok(q) => q,
@@ -853,7 +891,7 @@ impl MqttSnServer {
                         let bytes = topic_name.as_bytes();
                         u16::from_be_bytes([bytes[0], bytes[1]])
                     } else {
-                        c.assign_topic_id(&topic_name, next_topic_id)
+                        c.assign_topic_id(&topic_name)
                     };
                     SnPacket::Suback {
                         flags: qos_to_flags(qos),
@@ -882,20 +920,33 @@ impl MqttSnServer {
 }
 
 /// 出站 forwarder：从会话 tx 通道取出 OutboundPublish，封装为 SN PUBLISH 经 UDP 回送
+///
+/// 并发安全：每次投递前校验 `sessions.owns(client_id, epoch)`，
+/// 避免 UDP peer (ip,port) 被 NAT 回收后新客户端复用同地址导致跨会话数据泄露。
 async fn forward_outbound(
     mut rx: mpsc::Receiver<OutboundPublish>,
     socket: Arc<UdpSocket>,
     peer: SocketAddr,
     client_id: String,
+    epoch: u64,
+    broker: Arc<BrokerState>,
     clients: Arc<DashMap<SocketAddr, SnClient>>,
-    next_topic_id: Arc<AtomicU16>,
 ) {
     while let Some(msg) = rx.recv().await {
+        // 关键：每次投递前校验当前连接仍持有该会话（未被新连接接管 / 已断开）
+        if !broker.sessions().owns(&client_id, epoch) {
+            debug!(%peer, client = %client_id, "MQTT-SN forwarder: session no longer owned, exiting");
+            break;
+        }
         let (topic_id, msg_id, qos) = match clients.get_mut(&peer) {
             Some(mut c) => {
+                // 二次校验：peer 上的 SnClient 必须仍是同一个会话（同 epoch）
+                if c.epoch != epoch {
+                    debug!(%peer, client = %client_id, "MQTT-SN forwarder: peer reused by new session, exiting");
+                    break;
+                }
                 // 复用既有主题 ID；若该主题未被客户端 REGISTER/SUBSCRIBE，则现分配一个
-                // 使用全局原子计数器 assign_topic_id，避免线性扫描与跨客户端 ID 冲突
-                let tid = c.assign_topic_id(&msg.topic, &next_topic_id);
+                let tid = c.assign_topic_id(&msg.topic);
                 let mid = if msg.qos != QoS::AtMostOnce {
                     Some(c.allocate_msg_id())
                 } else {
@@ -919,7 +970,7 @@ async fn forward_outbound(
             flags,
             topic_id,
             msg_id: mid,
-            data: msg.payload.clone(),
+            data: msg.payload.to_vec(), // MQTT-SN UDP 帧：Bytes → Vec<u8> 拷贝（UDP 发送边界）
         };
         let data = encode_packet(&pkt);
         if !data.is_empty() {

@@ -20,7 +20,7 @@ fn publish_qos0_roundtrip() {
         retain: true,
         topic: "sensor/temp".into(),
         packet_id: None,
-        payload: b"23.5".to_vec(),
+        payload: bytes::Bytes::from_static(b"23.5"),
     });
     let decoded = roundtrip(p);
     match decoded {
@@ -28,7 +28,7 @@ fn publish_qos0_roundtrip() {
             assert_eq!(d.topic, "sensor/temp");
             assert_eq!(d.qos, QoS::AtMostOnce);
             assert!(d.retain);
-            assert_eq!(d.payload, b"23.5");
+            assert_eq!(&d.payload[..], b"23.5");
             assert!(d.packet_id.is_none());
         }
         other => panic!("expected Publish, got {other:?}"),
@@ -43,7 +43,7 @@ fn publish_qos1_roundtrip() {
         retain: false,
         topic: "a/b".into(),
         packet_id: Some(1234),
-        payload: vec![1, 2, 3, 4],
+        payload: bytes::Bytes::from(vec![1, 2, 3, 4]),
     });
     let decoded = roundtrip(p);
     match decoded {
@@ -51,7 +51,7 @@ fn publish_qos1_roundtrip() {
             assert_eq!(d.qos, QoS::AtLeastOnce);
             assert!(d.dup);
             assert_eq!(d.packet_id, Some(1234));
-            assert_eq!(d.payload, vec![1, 2, 3, 4]);
+            assert_eq!(&d.payload[..], &[1, 2, 3, 4][..]);
         }
         other => panic!("expected Publish, got {other:?}"),
     }

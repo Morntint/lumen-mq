@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
 use parking_lot::Mutex;
@@ -92,13 +93,12 @@ impl IpConnectionCounter {
         *v
     }
 
-    /// 减少某 IP 的连接计数，返回减少后的值；归零时移除条目
+    /// 减少某 IP 的连接计数；归零时移除条目
     pub fn dec(&self, ip: IpAddr) {
         let mut m = self.inner.lock();
         if let Some(v) = m.get_mut(&ip) {
-            if *v > 0 {
-                *v -= 1;
-            }
+            // checked_sub 合并双分支：饱和减法，0 不会再减
+            *v = v.checked_sub(1).unwrap_or(0);
             if *v == 0 {
                 m.remove(&ip);
             }
@@ -121,34 +121,50 @@ impl IpConnectionCounter {
 /// 每客户端令牌桶表（用于 PUBLISH 速率限流）
 ///
 /// 懒初始化：客户端首次 PUBLISH 时创建其桶。桶配置变更时整体重建。
+///
+/// 设计要点：
+/// - 自身持有一把细粒度 `Mutex<HashMap>`，外层无需再套 Mutex（避免双重加锁）。
+/// - `capacity`/`refill_per_second` 用 `AtomicU32`，使 `reset(&self)` 可在无外层锁的情况下
+///   与 `try_consume` 并发安全地更新配置。
+/// - 热路径优化：`try_consume` 命中已有桶时仅以 `&str` 借用查找，**不分配 String**；
+///   仅首次见到某 client_id 时分配一次 String 作为 HashMap key。
 #[derive(Debug, Default)]
 pub struct ClientRateLimiter {
     /// 桶容量 = 每秒补充量（即允许小突发）
-    capacity: u32,
-    refill_per_second: u32,
+    capacity: AtomicU32,
+    refill_per_second: AtomicU32,
     inner: Mutex<HashMap<String, TokenBucket>>,
 }
 
 impl ClientRateLimiter {
     pub fn new(refill_per_second: u32) -> Self {
+        // 容量设为 2 倍速率，允许短时小突发
+        let capacity = refill_per_second.saturating_mul(2).max(1);
         Self {
-            // 容量设为 2 倍速率，允许短时小突发
-            capacity: refill_per_second.saturating_mul(2).max(1),
-            refill_per_second,
+            capacity: AtomicU32::new(capacity),
+            refill_per_second: AtomicU32::new(refill_per_second),
             inner: Mutex::new(HashMap::new()),
         }
     }
 
     /// 尝试为某客户端消费 1 个令牌；成功返回 true
     pub fn try_consume(&self, client_id: &str) -> bool {
-        if self.refill_per_second == 0 {
-            return true; // 0 表示不限流
+        // 0 表示不限流；原子读，与 reset 并发安全
+        if self.refill_per_second.load(Ordering::Relaxed) == 0 {
+            return true;
         }
+        let capacity = self.capacity.load(Ordering::Relaxed);
+        let refill = self.refill_per_second.load(Ordering::Relaxed);
         let mut m = self.inner.lock();
-        let bucket = m
-            .entry(client_id.to_string())
-            .or_insert_with(|| TokenBucket::new(self.capacity, self.refill_per_second));
-        bucket.try_consume(1)
+        // 命中已有桶：&str 借用查找，零分配
+        if let Some(bucket) = m.get_mut(client_id) {
+            return bucket.try_consume(1);
+        }
+        // 首次见到该 client_id：创建桶并分配一次 String key
+        let mut bucket = TokenBucket::new(capacity, refill);
+        let ok = bucket.try_consume(1);
+        m.insert(client_id.to_string(), bucket);
+        ok
     }
 
     /// 客户端断开时清理其桶，释放内存
@@ -156,11 +172,13 @@ impl ClientRateLimiter {
         self.inner.lock().remove(client_id);
     }
 
-    /// 重置配置（热更新时调用）：清空所有桶
-    pub fn reset(&mut self, refill_per_second: u32) {
-        self.capacity = refill_per_second.saturating_mul(2).max(1);
-        self.refill_per_second = refill_per_second;
-        self.inner.get_mut().clear();
+    /// 重置配置（热更新时调用）：更新容量/速率并清空所有桶
+    pub fn reset(&self, refill_per_second: u32) {
+        self.capacity
+            .store(refill_per_second.saturating_mul(2).max(1), Ordering::Relaxed);
+        self.refill_per_second
+            .store(refill_per_second, Ordering::Relaxed);
+        self.inner.lock().clear();
     }
 }
 

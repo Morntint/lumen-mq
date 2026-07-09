@@ -8,6 +8,8 @@
 //! - PINGREQ/PINGRESP
 //! - DISCONNECT
 
+#![allow(clippy::field_reassign_with_default)]
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -303,7 +305,7 @@ async fn sn_publish_to_tcp_subscriber() -> anyhow::Result<()> {
     match inbound {
         Packet::Publish(Publish { topic, payload, qos, .. }) => {
             assert_eq!(topic, "sensor/temp");
-            assert_eq!(payload, b"23.5C");
+            assert_eq!(&payload[..], b"23.5C");
             assert_eq!(qos, QoS::AtMostOnce);
         }
         other => panic!("expected PUBLISH, got {other:?}"),
@@ -345,7 +347,7 @@ async fn sn_subscriber_receives_from_tcp_publish() -> anyhow::Result<()> {
         retain: false,
         topic: "cmd/reboot".into(),
         packet_id: None,
-        payload: b"now".to_vec(),
+        payload: bytes::Bytes::from_static(b"now"),
     }))
     .await?;
 
