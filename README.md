@@ -1,5 +1,8 @@
 # LumenMQ
 
+> **声明：本项目仅用于学习与开发目的，不推荐用于生产环境。**
+> **Disclaimer: This project is for learning and development purposes only. NOT recommended for production use.**
+
 **轻量化工业级 MQTT Broker** — 使用 Rust 编写，面向工业物联网（IIoT）场景。
 
 LumenMQ 实现了 MQTT 3.1.1 / 5.0 / MQTT-SN 多协议接入，内置安全中间件、消息插件、持久化存储与运维 HTTP API，单节点可承载十万级并发连接，适合在资源受限的工业网关与边缘节点上部署。
@@ -248,4 +251,4 @@ Release profile 已优化：`opt-level=3`、`lto="thin"`、`codegen-units=1`、`
 
 ## License
 
-Apache-2.0
+MIT
