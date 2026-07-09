@@ -116,8 +116,7 @@ where
                     }
                 },
                 Poll::Ready(Some(Err(e))) => {
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::Other,
+                    return Poll::Ready(Err(io::Error::other(
                         e.to_string(),
                     )));
                 }
@@ -154,14 +153,12 @@ where
                     .start_send(Message::binary(buf.to_vec()))
                 {
                     Ok(()) => Poll::Ready(Ok(buf.len())),
-                    Err(e) => Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::Other,
+                    Err(e) => Poll::Ready(Err(io::Error::other(
                         e.to_string(),
                     ))),
                 }
             }
-            Poll::Ready(Err(e)) => Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::Other,
+            Poll::Ready(Err(e)) => Poll::Ready(Err(io::Error::other(
                 e.to_string(),
             ))),
             Poll::Pending => Poll::Pending,
@@ -171,7 +168,7 @@ where
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.get_mut().inner)
             .poll_flush(cx)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+            .map_err(|e| io::Error::other(e.to_string()))
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -181,8 +178,7 @@ where
                 this.closed = true;
                 Poll::Ready(Ok(()))
             }
-            Poll::Ready(Err(e)) => Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::Other,
+            Poll::Ready(Err(e)) => Poll::Ready(Err(io::Error::other(
                 e.to_string(),
             ))),
             Poll::Pending => Poll::Pending,
@@ -212,6 +208,7 @@ impl WsServer {
     }
 
     /// 启动并阻塞运行，直到收到关闭信号
+    #[allow(clippy::result_large_err)]
     pub async fn run(mut self) -> std::io::Result<()> {
         let listener = TcpListener::bind(self.bind).await?;
         info!(addr = %self.bind, path = %self.path, "WebSocket MQTT listener started");
@@ -248,7 +245,7 @@ impl WsServer {
 
                     tokio::spawn(async move {
                         // WebSocket 握手（含子协议协商 + 路径校验）
-                        let handshake = tokio_tungstenite::accept_hdr_async(socket, |req: &Request, mut resp: Response| -> Result<Response, ErrorResponse> {
+                        let handshake = tokio_tungstenite::accept_hdr_async(socket, |req: &Request, mut resp: Response| -> Result<Response, ErrorResponse> { // clippy::result_large_err: axum 回调签名约束，无法规避
                             // 路径软校验：记录不匹配情况，但不拒绝（兼容浏览器/MQTT.js 任意路径）
                             let req_path = req.uri().path();
                             if req_path != expected_path.as_str() {

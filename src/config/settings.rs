@@ -4,6 +4,7 @@ use std::path::PathBuf;
 /// 顶层配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+#[derive(Default)]
 pub struct Settings {
     pub broker: BrokerConfig,
     pub tcp: TcpConfig,
@@ -19,24 +20,6 @@ pub struct Settings {
     pub plugin: PluginConfig,
 }
 
-impl Default for Settings {
-    fn default() -> Self {
-        Self {
-            broker: BrokerConfig::default(),
-            tcp: TcpConfig::default(),
-            tls: TlsConfig::default(),
-            websocket: WebSocketConfig::default(),
-            mqtt_sn: MqttSnConfig::default(),
-            auth: AuthConfig::default(),
-            storage: StorageConfig::default(),
-            log: LogConfig::default(),
-            monitor: MonitorConfig::default(),
-            admin: AdminConfig::default(),
-            security: SecurityConfig::default(),
-            plugin: PluginConfig::default(),
-        }
-    }
-}
 
 /// Broker 全局参数
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -137,15 +120,12 @@ pub struct AuthConfig {
 
 impl Default for AuthConfig {
     fn default() -> Self {
+        // 默认匿名模式（开发友好）；生产环境必须显式配置用户名密码
+        // 不再使用硬编码的 admin/public 默认密码（安全风险）
         Self {
-            mode: AuthMode::UsernamePassword,
-            allow_anonymous: false,
-            users: vec![UserConfig {
-                username: "admin".into(),
-                password: "public".into(),
-                publish_acl: vec![],
-                subscribe_acl: vec![],
-            }],
+            mode: AuthMode::Anonymous,
+            allow_anonymous: true,
+            users: vec![],
         }
     }
 }
@@ -241,6 +221,7 @@ pub struct AdminConfig {
 /// 安全中间件配置（阶段四：IP 黑白名单 + 连接/消息限流）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+#[derive(Default)]
 pub struct SecurityConfig {
     /// 是否启用安全中间件
     pub enabled: bool,
@@ -256,22 +237,11 @@ pub struct SecurityConfig {
     pub max_payload_bytes: usize,
 }
 
-impl Default for SecurityConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            ip_blacklist: Vec::new(),
-            ip_whitelist: Vec::new(),
-            max_connections_per_ip: 0,
-            publish_rate_per_second: 0,
-            max_payload_bytes: 0,
-        }
-    }
-}
 
 /// 消息插件配置（阶段四：主题 ACL + 载荷黑白名单 + HTTP 转发 hook）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+#[derive(Default)]
 pub struct PluginConfig {
     /// 是否启用插件中间件
     pub enabled: bool,
@@ -283,16 +253,6 @@ pub struct PluginConfig {
     pub forward: ForwardConfig,
 }
 
-impl Default for PluginConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            topic_acl: TopicAclConfig::default(),
-            payload_filter: PayloadFilterConfig::default(),
-            forward: ForwardConfig::default(),
-        }
-    }
-}
 
 /// 主题 ACL 配置（黑名单优先于白名单）
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

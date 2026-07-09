@@ -20,7 +20,7 @@ use rustls_pemfile::{certs, private_key};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio_rustls::TlsAcceptor;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::broker::BrokerState;
 use crate::config::TlsConfig;
@@ -28,8 +28,12 @@ use crate::utils::{BrokerError, BrokerResult};
 
 /// 安装 rustls ring 加密后端为进程默认（多次调用安全，仅首次生效）
 fn install_default_crypto_provider() {
-    // install_default 返回 Err 表示已被安装；忽略即可
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    // install_default 返回 Err 表示已被安装（正常）或安装失败（异常）
+    if let Err(e) = rustls::crypto::ring::default_provider().install_default() {
+        // 已安装是预期行为（多模块初始化），仅对真正的安装失败告警
+        // rustls 的 CryptoProvider::install_default 已安装时返回 Err 但不携带具体原因
+        debug!(error = ?e, "rustls crypto provider already installed or install failed (may be harmless if already installed)");
+    }
 }
 
 /// 从 PEM 文件读取证书链

@@ -190,6 +190,8 @@ async fn wait_for_signal() {
 }
 
 fn parse_bind(bind: &str) -> std::net::SocketAddr {
-    bind.parse()
-        .unwrap_or_else(|_| panic!("invalid bind address: {bind}"))
+    bind.parse().unwrap_or_else(|e| {
+        eprintln!("FATAL: invalid bind address '{bind}': {e}");
+        std::process::exit(1);
+    })
 }

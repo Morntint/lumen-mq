@@ -104,6 +104,7 @@ impl OutboundInflightTable {
     /// 扫描所有 inflight，对超过 `timeout` 未应答且未达 `max_retries` 的项：
     /// - 更新 last_sent_at 与 retry_count
     /// - 返回 (packet_id, 报文) 列表供上层重发
+    ///
     /// 达到 max_retries 的项会被移除并计入 failed 列表
     pub fn retry_expired(
         &mut self,

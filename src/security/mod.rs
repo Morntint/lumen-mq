@@ -30,6 +30,7 @@ pub use limiter::{ClientRateLimiter, IpConnectionCounter, TokenBucket};
 
 /// 已编译的安全规则（不可变，热更新时整体替换）
 #[derive(Debug)]
+#[derive(Default)]
 struct SecurityPolicy {
     enabled: bool,
     acl: IpAcl,
@@ -38,17 +39,6 @@ struct SecurityPolicy {
     max_payload_bytes: usize,
 }
 
-impl Default for SecurityPolicy {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            acl: IpAcl::default(),
-            max_connections_per_ip: 0,
-            publish_rate_per_second: 0,
-            max_payload_bytes: 0,
-        }
-    }
-}
 
 /// 安全中间件守卫（共享句柄）
 ///

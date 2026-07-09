@@ -35,6 +35,7 @@ pub struct SessionEntry {
 
 impl SessionEntry {
     /// 创建 clean_session=false 的会话 entry（带离线队列）
+    #[allow(clippy::too_many_arguments)]
     pub fn persistent(
         client_id: String,
         tx: mpsc::Sender<OutboundPublish>,
@@ -126,7 +127,12 @@ impl SessionManager {
     /// 若已存在同 client_id 会话：
     /// - 旧会话若 clean_session=false，其离线队列会被取出回放给新连接
     /// - 旧连接将被其自身循环通过 epoch 比对清理
+    ///
     /// `session_expiry`：MQTT 5.0 Session Expiry Interval（秒）；None/Some(0) 仅对 clean=false 生效
+    ///
+    /// 并发安全：drain 旧离线消息 + insert 新 entry 通过 entry API 原子完成，
+    /// 并发 register 同一 client_id 不会导致消息重复投递。
+    #[allow(clippy::too_many_arguments)]
     pub fn register(
         &self,
         client_id: String,
@@ -138,19 +144,10 @@ impl SessionManager {
         session_expiry: Option<u32>,
     ) -> (u64, bool, Vec<OutboundPublish>) {
         let epoch = self.epoch_counter.fetch_add(1, Ordering::Relaxed) + 1;
-        // 取出旧会话的离线消息（若有）
         let mut drained: Vec<OutboundPublish> = Vec::new();
         let mut session_present = false;
-        if let Some(old) = self.sessions.get(&client_id) {
-            if !old.clean_session {
-                session_present = true;
-                if let Some(q) = &old.offline_queue {
-                    drained = q.drain();
-                }
-            }
-        }
 
-        let entry = if clean_session {
+        let new_entry = if clean_session {
             SessionEntry::clean(
                 client_id.clone(),
                 tx,
@@ -172,7 +169,25 @@ impl SessionManager {
                 session_expiry,
             )
         };
-        self.sessions.insert(client_id, entry);
+
+        // 原子 drain + insert：entry API 在持锁期间完成 drain 旧离线消息并替换 entry，
+        // 避免并发 register 同一 client_id 时两次 get() 都看到旧 entry 导致重复 drain
+        use dashmap::mapref::entry::Entry;
+        match self.sessions.entry(client_id) {
+            Entry::Occupied(mut occ) => {
+                let old = occ.get_mut();
+                if !old.clean_session {
+                    session_present = true;
+                    if let Some(q) = &old.offline_queue {
+                        drained = q.drain();
+                    }
+                }
+                occ.insert(new_entry);
+            }
+            Entry::Vacant(vac) => {
+                vac.insert(new_entry);
+            }
+        }
         (epoch, session_present, drained)
     }
 

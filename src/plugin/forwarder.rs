@@ -141,7 +141,7 @@ impl Forwarder {
             Err(mpsc::error::TrySendError::Full(_)) => {
                 let prev = self.dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 crate::monitor::METRICS.inc_forward_dropped();
-                if prev % 100 == 0 {
+                if prev.is_multiple_of(100) {
                     warn!(dropped = prev + 1, "forward queue full, dropping oldest messages");
                 }
             }

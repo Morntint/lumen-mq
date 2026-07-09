@@ -353,7 +353,7 @@ impl BrokerState {
         }
 
         // 3. 鉴权
-        let _identity = match self.auth.authenticate(
+        let identity = match self.auth.authenticate(
             &connect.client_id,
             connect.username.as_deref(),
             connect.password.as_deref(),
@@ -381,6 +381,7 @@ impl BrokerState {
         ctx.keep_alive = keep_alive;
         ctx.protocol_level = connect.protocol_level;
         ctx.authenticated = true;
+        ctx.username = identity.username;
         ctx.touch();
 
         // 5. 注册会话（含接管旧连接 + 取回离线消息）
@@ -407,6 +408,7 @@ impl BrokerState {
         info!(
             client = %client_id,
             peer = %peer,
+            user = ?ctx.username,
             clean,
             keep_alive,
             session_present,
@@ -581,6 +583,7 @@ impl BrokerState {
     }
 
     /// 处理一条入站报文
+    #[allow(clippy::too_many_arguments)]
     async fn handle_packet<S>(
         &self,
         packet: Packet,
@@ -753,6 +756,7 @@ impl BrokerState {
     }
 
     /// 处理 SUBSCRIBE 报文：注册订阅、回 SUBACK、投递匹配的 retained 消息
+    #[allow(clippy::too_many_arguments)]
     async fn handle_subscribe<S>(
         &self,
         s: crate::codec::Subscribe,

@@ -31,21 +31,13 @@ pub use topic_acl::{AclVerdict, TopicAcl};
 
 /// 已编译的插件策略（不可变，热更新时整体替换）
 #[derive(Debug)]
+#[derive(Default)]
 struct PluginPolicy {
     enabled: bool,
     topic_acl: TopicAcl,
     payload_filter: PayloadFilter,
 }
 
-impl Default for PluginPolicy {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            topic_acl: TopicAcl::default(),
-            payload_filter: PayloadFilter::default(),
-        }
-    }
-}
 
 /// 插件中间件守卫（共享句柄）
 ///

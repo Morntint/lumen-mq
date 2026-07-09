@@ -544,7 +544,7 @@ impl MqttSnServer {
         for entry in clients.iter() {
             cleanup_session(&broker, &entry.client_id, entry.epoch, entry.clean);
         }
-        let _ = cleanup_handle.abort();
+        cleanup_handle.abort();
         Ok(())
     }
 
@@ -639,6 +639,7 @@ impl MqttSnServer {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn handle_connect(
         broker: &Arc<BrokerState>,
         clients: &Arc<DashMap<SocketAddr, SnClient>>,
@@ -707,6 +708,7 @@ impl MqttSnServer {
         });
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn handle_publish(
         broker: &Arc<BrokerState>,
         clients: &Arc<DashMap<SocketAddr, SnClient>>,
@@ -789,6 +791,7 @@ impl MqttSnServer {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn handle_subscribe(
         broker: &Arc<BrokerState>,
         clients: &Arc<DashMap<SocketAddr, SnClient>>,

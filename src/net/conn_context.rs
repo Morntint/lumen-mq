@@ -17,6 +17,8 @@ pub struct ConnContext {
     pub authenticated: bool,
     /// 协议级别（3=3.1, 4=3.1.1, 5=5.0）
     pub protocol_level: u8,
+    /// 已认证用户名（匿名连接为 None）
+    pub username: Option<String>,
 }
 
 impl ConnContext {
@@ -31,6 +33,7 @@ impl ConnContext {
             last_activity: now,
             authenticated: false,
             protocol_level: 4,
+            username: None,
         }
     }
 

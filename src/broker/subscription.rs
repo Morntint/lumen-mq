@@ -70,13 +70,16 @@ impl SubscriptionTree {
     pub fn subscribe(&self, client_id: &str, filter: &str, qos: QoS) -> BrokerResult<()> {
         // 检测共享订阅：$share/{group}/{real_filter}
         if let Some((group, real_filter)) = parse_shared_filter(filter) {
-            validate_filter(&real_filter)?;
-            let mut shared = self.shared.write();
-            let entry = shared
-                .entry((group.to_string(), real_filter.to_string()))
-                .or_default();
-            entry.members.insert(client_id.to_string(), qos);
+            validate_filter(real_filter)?;
+            {
+                let mut shared = self.shared.write();
+                let entry = shared
+                    .entry((group.to_string(), real_filter.to_string()))
+                    .or_default();
+                entry.members.insert(client_id.to_string(), qos);
+            }
             // 维护反向索引（存完整 filter 字符串，便于 unsubscribe 定位）
+            // 注意：先释放 shared 锁再获取 reverse 锁，避免多锁同时持有导致死锁
             let mut rev = self.reverse.write();
             let list = rev.entry(client_id.to_string()).or_default();
             if let Some(slot) = list.iter_mut().find(|(f, _)| f == filter) {
@@ -89,13 +92,15 @@ impl SubscriptionTree {
 
         validate_filter(filter)?;
         let segments: Vec<&str> = filter.split('/').collect();
-        let mut root = self.root.write();
-        let mut node = &mut *root;
-        for seg in &segments {
-            node = node.child_for_segment_mut(seg);
+        {
+            let mut root = self.root.write();
+            let mut node = &mut *root;
+            for seg in &segments {
+                node = node.child_for_segment_mut(seg);
+            }
+            node.subscribers.insert(client_id.to_string(), qos);
         }
-        node.subscribers.insert(client_id.to_string(), qos);
-        // 维护反向索引
+        // 维护反向索引（先释放 root 锁再获取 reverse 锁）
         let mut rev = self.reverse.write();
         let entry = rev.entry(client_id.to_string()).or_default();
         // 若已存在同 filter，更新 qos；否则追加
@@ -110,15 +115,19 @@ impl SubscriptionTree {
     pub fn unsubscribe(&self, client_id: &str, filter: &str) -> BrokerResult<bool> {
         // 共享订阅
         if let Some((group, real_filter)) = parse_shared_filter(filter) {
-            let mut shared = self.shared.write();
-            let mut removed = false;
-            if let Some(entry) = shared.get_mut(&(group.to_string(), real_filter.to_string())) {
-                removed = entry.members.remove(client_id).is_some();
-                // 组空则清理整个条目
-                if removed && entry.members.is_empty() {
-                    shared.remove(&(group.to_string(), real_filter.to_string()));
+            let removed = {
+                let mut shared = self.shared.write();
+                let mut removed = false;
+                if let Some(entry) = shared.get_mut(&(group.to_string(), real_filter.to_string())) {
+                    removed = entry.members.remove(client_id).is_some();
+                    // 组空则清理整个条目
+                    if removed && entry.members.is_empty() {
+                        shared.remove(&(group.to_string(), real_filter.to_string()));
+                    }
                 }
-            }
+                removed
+            };
+            // 先释放 shared 锁再获取 reverse 锁
             if removed {
                 let mut rev = self.reverse.write();
                 if let Some(list) = rev.get_mut(client_id) {
@@ -132,10 +141,12 @@ impl SubscriptionTree {
         }
 
         let segments: Vec<&str> = filter.split('/').collect();
-        let mut root = self.root.write();
-        let removed = remove_recursive(&mut root, &segments, 0, client_id);
+        let removed = {
+            let mut root = self.root.write();
+            remove_recursive(&mut root, &segments, 0, client_id)
+        };
+        // 先释放 root 锁再获取 reverse 锁
         if removed {
-            // 维护反向索引
             let mut rev = self.reverse.write();
             if let Some(entry) = rev.get_mut(client_id) {
                 entry.retain(|(f, _)| f != filter);
@@ -148,39 +159,47 @@ impl SubscriptionTree {
     }
 
     /// 移除该客户端所有订阅（含共享）
+    /// 锁顺序：root → drop → shared → drop → reverse，绝不同时持有多把锁
     pub fn unsubscribe_all(&self, client_id: &str) {
-        // 收集该客户端的共享订阅 key
-        let shared_keys: Vec<(String, String)> = {
-            let shared = self.shared.read();
-            shared
-                .iter()
-                .filter_map(|(k, e)| {
-                    if e.members.contains_key(client_id) {
-                        Some(k.clone())
-                    } else {
-                        None
-                    }
-                })
-                .collect()
-        };
-        // 从共享结构中移除
-        if !shared_keys.is_empty() {
-            let mut shared = self.shared.write();
-            for k in &shared_keys {
-                if let Some(entry) = shared.get_mut(k) {
-                    entry.members.remove(client_id);
-                    if entry.members.is_empty() {
-                        shared.remove(k);
+        // 1. 从 root 订阅树移除（持有 root 锁）
+        {
+            let mut root = self.root.write();
+            remove_all(&mut root, client_id);
+        }
+
+        // 2. 从共享订阅移除（先收集 key 再写，持有 shared 锁）
+        {
+            let shared_keys: Vec<(String, String)> = {
+                let shared = self.shared.read();
+                shared
+                    .iter()
+                    .filter_map(|(k, e)| {
+                        if e.members.contains_key(client_id) {
+                            Some(k.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            };
+            if !shared_keys.is_empty() {
+                let mut shared = self.shared.write();
+                for k in &shared_keys {
+                    if let Some(entry) = shared.get_mut(k) {
+                        entry.members.remove(client_id);
+                        if entry.members.is_empty() {
+                            shared.remove(k);
+                        }
                     }
                 }
             }
         }
 
-        let mut root = self.root.write();
-        remove_all(&mut root, client_id);
-        // 维护反向索引
-        let mut rev = self.reverse.write();
-        rev.remove(client_id);
+        // 3. 清理反向索引（持有 reverse 锁）
+        {
+            let mut rev = self.reverse.write();
+            rev.remove(client_id);
+        }
     }
 
     /// 匹配主题，返回去重后的 (client_id, delivery_qos)（仅普通订阅）
